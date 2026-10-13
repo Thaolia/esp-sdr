@@ -93,11 +93,11 @@ const markerBands={
  ble:{color:'#c77dff',chans:[...Array(40)].map((_,i)=>{const f=2402+2*i,adv=f===2402?37:f===2426?38:f===2480?39:0;return {n:i,f,w:2,adv};})},
  bt:{color:'#8f9ca2',chans:[...Array(79)].map((_,i)=>({n:i,f:2402+i,w:1}))}
 };
-let markerPrefs={wifi24:true,wifi5:false,ble:false,bt:false};
+let markerPrefs={wifi24:true,wifi5:false,ble:false,bt:false,waterfall:false};
 try{const v=JSON.parse(localStorage.getItem('espSdrMarkers')||'null');if(v&&typeof v==='object')markerPrefs={...markerPrefs,...v};}catch(e){}
 // Draw enabled channel markers on the spectrum: faint band tint + center line,
 // with channel numbers thinned by pixel spacing so dense bands stay legible.
-function drawChannelMarkers(c,ctx,W,H,d){
+function drawChannelMarkers(c,ctx,W,H,d,linesOnly){
  if(!c||!c.rate)return;
  const k=freqFactor(),span=(view.b-view.a)*c.rate*k,f0=(c.frequency*1e6+(view.a-.5)*c.rate)*k,mapX=f=>(f-f0)/span*W;
  ctx.save();ctx.font=`${11*d}px Carlito,sans-serif`;ctx.textBaseline='top';
@@ -107,12 +107,12 @@ function drawChannelMarkers(c,ctx,W,H,d){
   // Bluetooth classic (79 x 1 MHz): per-channel ticks only when zoomed in enough
   // to stay readable; at a wide span show the whole band as one faint region
   // with a label so an enabled checkbox is never a silent no-op.
-  if(key==='bt'&&span>40e6){const x0=mapX(2401.5e6),x1=mapX(2480.5e6);if(x1>0&&x0<W){ctx.globalAlpha=.05;ctx.fillRect(x0,0,x1-x0,H);ctx.globalAlpha=1;ctx.fillText('BT',Math.max(2,x0+3),2*d);}continue;}
+  if(key==='bt'&&span>40e6){const x0=mapX(2401.5e6),x1=mapX(2480.5e6);if(x1>0&&x0<W){if(!linesOnly){ctx.globalAlpha=.05;ctx.fillRect(x0,0,x1-x0,H);}ctx.globalAlpha=1;ctx.fillText('BT',Math.max(2,x0+3),2*d);}continue;}
   let lastLabel=-1e9;
   for(const ch of band.chans){
    const x=mapX(ch.f*1e6);if(x<-20||x>W+20)continue;
    const emph=ch.adv;
-   if(ch.w){const x0=mapX((ch.f-ch.w/2)*1e6),x1=mapX((ch.f+ch.w/2)*1e6);ctx.globalAlpha=emph?.1:.045;ctx.fillRect(x0,0,x1-x0,H);}
+   if(ch.w&&!linesOnly){const x0=mapX((ch.f-ch.w/2)*1e6),x1=mapX((ch.f+ch.w/2)*1e6);ctx.globalAlpha=emph?.1:.045;ctx.fillRect(x0,0,x1-x0,H);}
    ctx.globalAlpha=emph?.6:.3;ctx.lineWidth=(emph?1.6:.8)*d;
    const xr=Math.round(x)+.5;ctx.beginPath();ctx.moveTo(xr,0);ctx.lineTo(xr,H);ctx.stroke();
    const text=ch.adv?('A'+ch.adv):String(ch.n);
@@ -120,6 +120,14 @@ function drawChannelMarkers(c,ctx,W,H,d){
   }
  }
  ctx.restore();
+}
+// Channel markers mirrored onto the waterfall via a non-scrolling overlay
+// canvas: lines + labels only (no band tint), cleared when disabled or idle.
+function drawWaterfallMarkers(){
+ const wm=$('waterfallMarkers');if(!wm)return;
+ const ctx=wm.getContext('2d');ctx.clearRect(0,0,wm.width,wm.height);
+ if(!markerPrefs.waterfall||!latest)return;
+ drawChannelMarkers({frequency:latest.frequency,rate:latest.rate},ctx,wm.width,wm.height,1,true);
 }
 // Short colored channel ticks along the bottom edge of the frequency axis,
 // echoing the spectrum markers. Digits have no descenders, so the bottom strip
@@ -156,7 +164,7 @@ function error(e,communication=false){
 $('dismissError').onclick=()=>error('');
 function config(){return {frequency:loFrequency(),rate:Number($('rate').value),bits:Number($('bits').value),fft:Number($('fft').value),bandwidth:analogBandwidth,gainMode:gainMode,gain:Number($('gain').value),trigger:{mode:'free'}};}
 function clear(){trace=null;maximum=null;waterHist=[];if(!keepView)view={a:0,b:1};keepView=false;wc.fillStyle='#11191e';wc.fillRect(0,0,water.width,water.height);draw();}
-function resize(){const d=Math.min(devicePixelRatio||1,2);spec.width=Math.round(spec.clientWidth*d);spec.height=Math.round(spec.clientHeight*d);water.width=Math.round(water.clientWidth);water.height=Math.round(water.clientHeight);wc.fillStyle='#11191e';wc.fillRect(0,0,water.width,water.height);redrawWater();draw();labels();}
+function resize(){const d=Math.min(devicePixelRatio||1,2);spec.width=Math.round(spec.clientWidth*d);spec.height=Math.round(spec.clientHeight*d);water.width=Math.round(water.clientWidth);water.height=Math.round(water.clientHeight);const wm=$('waterfallMarkers');if(wm){wm.width=water.width;wm.height=water.height;wm.style.top=water.offsetTop+'px';wm.style.left=water.offsetLeft+'px';wm.style.width=water.clientWidth+'px';wm.style.height=water.clientHeight+'px';}wc.fillStyle='#11191e';wc.fillRect(0,0,water.width,water.height);redrawWater();draw();labels();}
 function fmtHz(hz){const a=Math.abs(hz);return a>=1e9?(hz/1e9).toFixed(6)+' GHz':a>=1e6?(hz/1e6).toFixed(3)+' MHz':a>=1e3?(hz/1e3).toFixed(1)+' kHz':hz.toFixed(0)+' Hz';}
 function measBar(c){
  const k=freqFactor(),spec=connected&&spectrumMode,n=spec?specConfig().fft:c.fft,center=c.frequency*1e6*k,span=c.rate*k;
@@ -172,7 +180,7 @@ function measBar(c){
 function labels(f){tuningWarning();const c=f||config();drawAxis(c);measBar(c);}
 function draw(){const w=spec.width,h=spec.height,d=Math.min(devicePixelRatio||1,2),floor=Number($('floor').value),range=Number($('range').value);sc.fillStyle='#182126';sc.fillRect(0,0,w,h);sc.lineWidth=d;sc.font=`${14*d}px Carlito,sans-serif`;
 for(let i=0;i<=4;i++){const y=i*h/4;sc.strokeStyle='#344047';sc.beginPath();sc.moveTo(0,y);sc.lineTo(w,y);sc.stroke();sc.fillStyle='#a1adb2';sc.fillText(`${Math.round(floor+range-i*range/4)}`,8*d,Math.max(16*d,y-5*d));}
-{const c=latest?{frequency:latest.frequency,rate:latest.rate}:config(),t=axisTicks(c,w);sc.strokeStyle='#202a2f';sc.beginPath();for(const f of t.minors){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();sc.strokeStyle='#33424a';sc.beginPath();for(const f of t.major){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();if(tuneFrequency!==c.frequency){const x=t.x(tuneFrequency*1e6*freqFactor());sc.save();sc.setLineDash([4*d,4*d]);sc.strokeStyle='#37c96490';sc.beginPath();sc.moveTo(x,0);sc.lineTo(x,h);sc.stroke();sc.restore();}drawAxis(c);drawChannelMarkers(c,sc,w,h,d);}
+{const c=latest?{frequency:latest.frequency,rate:latest.rate}:config(),t=axisTicks(c,w);sc.strokeStyle='#202a2f';sc.beginPath();for(const f of t.minors){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();sc.strokeStyle='#33424a';sc.beginPath();for(const f of t.major){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();if(tuneFrequency!==c.frequency){const x=t.x(tuneFrequency*1e6*freqFactor());sc.save();sc.setLineDash([4*d,4*d]);sc.strokeStyle='#37c96490';sc.beginPath();sc.moveTo(x,0);sc.lineTo(x,h);sc.stroke();sc.restore();}drawAxis(c);drawChannelMarkers(c,sc,w,h,d);drawWaterfallMarkers();}
 function line(values,color,fill){if(!values)return;sc.beginPath();const L=values.length-1,sp=view.b-view.a,i0=Math.max(0,Math.floor(view.a*L)-1),i1=Math.min(L,Math.ceil(view.b*L)+1);for(let i=i0;i<=i1;i++){const v=values[i],x=(i/L-view.a)/sp*w,y=Math.max(0,Math.min(h,(1-(v-floor)/range)*h));if(i>i0)sc.lineTo(x,y);else sc.moveTo(x,y);}sc.strokeStyle=color;sc.lineWidth=1.2*d;sc.stroke();if(fill){sc.lineTo(w,h);sc.lineTo(0,h);sc.closePath();const g=sc.createLinearGradient(0,0,0,h);g.addColorStop(0,'#37c96445');g.addColorStop(1,'#37c96403');sc.fillStyle=g;sc.fill();}}
 if($('hold').checked)line(maximum,'#e6b969',false);line(trace,'#37c964',true);}
 function render(f){const k=[f.frequency,f.rate,f.bits,f.fft,f.bandwidth,f.gainMode,f.gainMode==='MANUAL'?f.gain:'HARDWARE'].join('/');if(key!==k){key=k;clear();}latest=f;const a=Number($('average').value);trace=f.spectrum.map((v,i)=>trace?10*Math.log10(a*10**(trace[i]/10)+(1-a)*10**(v/10)):v);maximum=f.spectrum.map((v,i)=>maximum?Math.max(maximum[i],v):v);draw();
@@ -462,7 +470,7 @@ $('frequency').closest('label').addEventListener('wheel',e=>{
 for(const b of document.querySelectorAll('[data-freq]'))b.onclick=()=>{$('frequency').value=b.dataset.freq;tuneFrequency=Number(b.dataset.freq);labels();};
 for(const id of ['floor','range'])$(id).oninput=()=>{$('floorValue').textContent=$('floor').value+' dBFS';$('rangeValue').textContent=$('range').value+' dB';$('scale').textContent=`${$('floor').value} → ${Number($('floor').value)+Number($('range').value)} dBFS`;redrawWater();draw();};
 $('hold').onchange=()=>{maximum=null;draw();};
-for(const key of ['wifi24','wifi5','ble','bt']){const el=$('mark'+key[0].toUpperCase()+key.slice(1));el.checked=markerPrefs[key];el.onchange=()=>{markerPrefs[key]=el.checked;try{localStorage.setItem('espSdrMarkers',JSON.stringify(markerPrefs));}catch(e){}draw();labels();};}
+for(const key of ['wifi24','wifi5','ble','bt','waterfall']){const el=$('mark'+key[0].toUpperCase()+key.slice(1));el.checked=markerPrefs[key];el.onchange=()=>{markerPrefs[key]=el.checked;try{localStorage.setItem('espSdrMarkers',JSON.stringify(markerPrefs));}catch(e){}draw();labels();};}
 // ---- frequency calibration (ppm) assistant ---------------------------------
 function fmtPpm(){if(!freqCal)return 'Calibration off';const hz=2440e6*freqCal/1e6;return `${freqCal>0?'+':''}${freqCal.toFixed(1)} ppm (${hz>=0?'+':'−'}${Math.abs(hz/1e3).toFixed(1)} kHz @ 2.44 GHz)`;}
 function applyCal(ppm){freqCal=Math.max(-500,Math.min(500,Number(ppm)||0));try{localStorage.setItem('espSdrFreqCal',String(freqCal));}catch(e){}$('calPpm').value=freqCal;$('calStatus').textContent=fmtPpm();draw();labels();}
@@ -483,6 +491,7 @@ function boardKey(){const sn=radio.port&&radio.port.device&&radio.port.device.se
 function readProfiles(){try{const v=JSON.parse(localStorage.getItem('espSdrProfiles')||'{}');return v&&typeof v==='object'?v:{};}catch(e){return {};}}
 function collectProfile(){return {freqCal,markers:{...markerPrefs},
  display:{floor:$('floor').value,range:$('range').value,average:$('average').value,hold:$('hold').checked,autoscale:$('autoscale').checked},
+ capture:{mode:spectrumMode,specRow:$('specRow').value,specDetector:$('specDetector').value},
  radio:{frequency:tuneFrequency,rate:$('rate').value,fft:$('fft').value,bits:$('bits').value,gainMode,gain:$('gain').value,bandwidth:analogBandwidth}};}
 function saveProfile(){if(!currentBoardKey)return;const all=readProfiles();all[currentBoardKey]=collectProfile();try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}}
 function markDirty(){if(loadingProfile||!connected||!currentBoardKey)return;clearTimeout(saveTimer);saveTimer=setTimeout(saveProfile,500);}
@@ -496,13 +505,17 @@ function loadProfile(){
  loadingProfile=true;
  try{
   if(typeof p.freqCal==='number')applyCal(p.freqCal);
-  if(p.markers&&typeof p.markers==='object')for(const k of ['wifi24','wifi5','ble','bt'])if(typeof p.markers[k]==='boolean'){markerPrefs[k]=p.markers[k];const el=$('mark'+k[0].toUpperCase()+k.slice(1));if(el)el.checked=p.markers[k];}
+  if(p.markers&&typeof p.markers==='object')for(const k of ['wifi24','wifi5','ble','bt','waterfall'])if(typeof p.markers[k]==='boolean'){markerPrefs[k]=p.markers[k];const el=$('mark'+k[0].toUpperCase()+k.slice(1));if(el)el.checked=p.markers[k];}
   const d=p.display||{};
   if(d.floor!==undefined){$('floor').value=d.floor;$('floorValue').textContent=$('floor').value+' dBFS';}
   if(d.range!==undefined){$('range').value=d.range;$('rangeValue').textContent=$('range').value+' dB';}
   if(d.average!==undefined)$('average').value=d.average;
   if(typeof d.hold==='boolean')$('hold').checked=d.hold;
   if(typeof d.autoscale==='boolean')$('autoscale').checked=d.autoscale;
+  const cap=p.capture||{};
+  if(typeof cap.mode==='boolean')spectrumMode=cap.mode&&radio.canStreamSpectrum;
+  if(cap.specRow!==undefined&&[...$('specRow').options].some(o=>o.value===String(cap.specRow)))$('specRow').value=String(cap.specRow);
+  if(cap.specDetector!==undefined&&[...$('specDetector').options].some(o=>o.value===String(cap.specDetector)))$('specDetector').value=String(cap.specDetector);
   const r=p.radio||{};
   if(Number.isInteger(r.frequency)&&radio.validFrequency(r.frequency)){tuneFrequency=r.frequency;$('frequency').value=r.frequency;}
   if(r.rate!==undefined&&radio.rxRates.includes(Number(r.rate)))$('rate').value=String(Number(r.rate));
