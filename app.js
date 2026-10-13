@@ -30,6 +30,8 @@ let freqCal=0;
 try{const v=Number(localStorage.getItem('espSdrFreqCal'));if(Number.isFinite(v)&&Math.abs(v)<=500)freqCal=v;}catch(e){}
 const freqFactor=()=>1+freqCal/1e6;
 let peakHzNominal=null,calObservedHz=null,calPicking=false;
+// Per-board configuration profiles, keyed by USB serial (native/WebUSB) or model.
+let currentBoardKey=null,loadingProfile=false,saveTimer=0;
 let connected=false,paused=false,latest=null,trace=null,maximum=null,previous=0,key='',running=false,tuneFrequency=2412,analogBandwidth=20;
 let loopDone=Promise.resolve();
 const spec=$('spectrum'),water=$('waterfall'),sc=spec.getContext('2d'),wc=water.getContext('2d');
@@ -88,7 +90,7 @@ function drawAxis(c){const el=$('axisCanvas');if(!el)return;const d=Math.min(dev
 const markerBands={
  wifi24:{color:'#37c964',chans:[...Array(13)].map((_,i)=>({n:i+1,f:2412+5*i,w:20})).concat([{n:14,f:2484,w:20}])},
  wifi5:{color:'#4aa3ff',chans:[36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165].map(n=>({n,f:5000+5*n,w:20}))},
- ble:{color:'#c77dff',chans:[...Array(40)].map((_,i)=>{const f=2402+2*i,adv=f===2402?37:f===2426?38:f===2480?39:0;return {n:adv||'',f,w:2,adv:!!adv};})},
+ ble:{color:'#c77dff',chans:[...Array(40)].map((_,i)=>{const f=2402+2*i,adv=f===2402?37:f===2426?38:f===2480?39:0;return {n:i,f,w:2,adv};})},
  bt:{color:'#8f9ca2',chans:[...Array(79)].map((_,i)=>({n:i,f:2402+i,w:1}))}
 };
 let markerPrefs={wifi24:true,wifi5:false,ble:false,bt:false};
@@ -113,8 +115,8 @@ function drawChannelMarkers(c,ctx,W,H,d){
    if(ch.w){const x0=mapX((ch.f-ch.w/2)*1e6),x1=mapX((ch.f+ch.w/2)*1e6);ctx.globalAlpha=emph?.1:.045;ctx.fillRect(x0,0,x1-x0,H);}
    ctx.globalAlpha=emph?.6:.3;ctx.lineWidth=(emph?1.6:.8)*d;
    const xr=Math.round(x)+.5;ctx.beginPath();ctx.moveTo(xr,0);ctx.lineTo(xr,H);ctx.stroke();
-   const text=ch.n===''?'':String(ch.n);
-   if(text&&x>=0&&x<=W&&x-lastLabel>=28*d){ctx.globalAlpha=1;const tw=ctx.measureText(text).width;ctx.fillText(text,Math.max(1,Math.min(W-tw-1,x-tw/2)),2*d);lastLabel=x;}
+   const text=ch.adv?('A'+ch.adv):String(ch.n);
+   if(x>=0&&x<=W&&(emph||x-lastLabel>=28*d)){ctx.globalAlpha=1;const tw=ctx.measureText(text).width;ctx.fillText(text,Math.max(1,Math.min(W-tw-1,x-tw/2)),2*d);lastLabel=x;}
   }
  }
  ctx.restore();
@@ -390,7 +392,14 @@ function savedPort(){try{return JSON.parse(localStorage.getItem(PORT_KEY)||'null
 function rememberPort(p){try{const i=p.getInfo?.()||{};if(i.usbVendorId)localStorage.setItem(PORT_KEY,JSON.stringify({vid:i.usbVendorId,pid:i.usbProductId,kind:SerialConnection.kind(p)}));}catch(e){}}
 async function choosePort(ev){
  if(!SerialConnection.supported())throw Error('WebSerial or WebUSB support is required in this browser.');
- if(!ev?.choosePort){const saved=savedPort(),ports=await SerialConnection.getPorts(saved?.kind);
+ if(!ev?.choosePort){const saved=savedPort();
+  // Prefer an already-granted WebUSB device: it exposes the chip serial (MAC)
+  // used to key per-board profiles. Never force a WebUSB picker that could fail
+  // to claim the port (e.g. a desktop OS driver owns the CDC interface).
+  if(navigator.usb){const usb=await SerialConnection.getPorts('webusb');
+   const u=saved?usb.filter(p=>{const i=p.getInfo?.()||{};return i.usbVendorId===saved.vid&&i.usbProductId===saved.pid;}):usb;
+   if(u.length===1)return u[0];}
+  const ports=await SerialConnection.getPorts(saved?.kind);
   const matches=saved?ports.filter(p=>{const i=p.getInfo?.()||{};return i.usbVendorId===saved.vid&&i.usbProductId===saved.pid;}):[];
   if(matches.length===1)return matches[0];if(ev?.auto)return null;}
  return SerialConnection.requestPort(ev?.kind);
@@ -438,7 +447,7 @@ async function openFirmwareInstaller(event){
  }catch(e){installer?.close();firmwareHandoff=false;error(e);}
  finally{connectionBusy=false;state();}
 }
-$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){await disconnectRadio();}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();spectrumMode=radio.canStreamSpectrum;applyRadioProfile();paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
+$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){await disconnectRadio();currentBoardKey=null;const pb=$('profileBox');if(pb)pb.hidden=true;}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();spectrumMode=radio.canStreamSpectrum;applyRadioProfile();loadProfile();paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
 $('pause').onclick=()=>{paused=!paused;previous=0;state();if(!paused){error('');loop();}};$('clear').onclick=clear;
 for(const id of ['rate','bits','fft'])$(id).onchange=()=>{state();labels();};
 $('frequency').onchange=()=>{tuneFrequency=Number($('frequency').value);labels();};
@@ -466,6 +475,49 @@ $('calReset').onclick=()=>{$('calForm').hidden=true;calPickOff();applyCal(0);};
 $('calFromPeak').onclick=()=>{if(peakHzNominal==null){error('No peak yet — connect and wait for a live signal.');return;}calGrab(peakHzNominal);};
 $('calApply').onclick=()=>{const trueMHz=Number($('calTrue').value);if(!Number.isFinite(trueMHz)||trueMHz<=0||!calObservedHz){error('Enter the reference true frequency in MHz.');return;}applyCal((trueMHz*1e6/calObservedHz-1)*1e6);$('calForm').hidden=true;calPickOff();error('');};
 $('calPick').onclick=()=>{calPicking=!calPicking;$('calPick').setAttribute('aria-pressed',String(calPicking));$('calPick').textContent=calPicking?'Click the peak on the graph…':'Pick on graph';};
+// ---- per-board configuration profiles --------------------------------------
+// Keyed by the native-USB serial number (the chip MAC, WebUSB only) when
+// available, otherwise by chip model. Settings auto-save (debounced) on any
+// aside interaction and reload when a known board connects.
+function boardKey(){const sn=radio.port&&radio.port.device&&radio.port.device.serialNumber;return sn?'sn:'+sn:'model:'+(radio.family||'?');}
+function readProfiles(){try{const v=JSON.parse(localStorage.getItem('espSdrProfiles')||'{}');return v&&typeof v==='object'?v:{};}catch(e){return {};}}
+function collectProfile(){return {freqCal,markers:{...markerPrefs},
+ display:{floor:$('floor').value,range:$('range').value,average:$('average').value,hold:$('hold').checked,autoscale:$('autoscale').checked},
+ radio:{frequency:tuneFrequency,rate:$('rate').value,fft:$('fft').value,bits:$('bits').value,gainMode,gain:$('gain').value,bandwidth:analogBandwidth}};}
+function saveProfile(){if(!currentBoardKey)return;const all=readProfiles();all[currentBoardKey]=collectProfile();try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}}
+function markDirty(){if(loadingProfile||!connected||!currentBoardKey)return;clearTimeout(saveTimer);saveTimer=setTimeout(saveProfile,500);}
+function updateProfileLabel(){const box=$('profileBox');if(!box)return;box.hidden=!connected||!currentBoardKey;if(box.hidden)return;
+ const name=radio.deviceName||('ESP32-'+radio.family);
+ $('profileKey').textContent=currentBoardKey.startsWith('sn:')?`${currentBoardKey.slice(3)} · ${name}`:`${name} · model-wide`;}
+function loadProfile(){
+ currentBoardKey=boardKey();updateProfileLabel();
+ const p=readProfiles()[currentBoardKey];
+ if(!p)return;  // first time for this board: keep chip defaults, saved on first change
+ loadingProfile=true;
+ try{
+  if(typeof p.freqCal==='number')applyCal(p.freqCal);
+  if(p.markers&&typeof p.markers==='object')for(const k of ['wifi24','wifi5','ble','bt'])if(typeof p.markers[k]==='boolean'){markerPrefs[k]=p.markers[k];const el=$('mark'+k[0].toUpperCase()+k.slice(1));if(el)el.checked=p.markers[k];}
+  const d=p.display||{};
+  if(d.floor!==undefined){$('floor').value=d.floor;$('floorValue').textContent=$('floor').value+' dBFS';}
+  if(d.range!==undefined){$('range').value=d.range;$('rangeValue').textContent=$('range').value+' dB';}
+  if(d.average!==undefined)$('average').value=d.average;
+  if(typeof d.hold==='boolean')$('hold').checked=d.hold;
+  if(typeof d.autoscale==='boolean')$('autoscale').checked=d.autoscale;
+  const r=p.radio||{};
+  if(Number.isInteger(r.frequency)&&radio.validFrequency(r.frequency)){tuneFrequency=r.frequency;$('frequency').value=r.frequency;}
+  if(r.rate!==undefined&&radio.rxRates.includes(Number(r.rate)))$('rate').value=String(Number(r.rate));
+  if(r.bits!==undefined&&radio.sampleBits.includes(Number(r.bits)))$('bits').value=String(Number(r.bits));
+  if(r.fft!==undefined&&[256,512,1024,2048,4096].includes(Number(r.fft)))$('fft').value=String(Number(r.fft));
+  if(r.gainMode==='MANUAL'||(r.gainMode==='HARDWARE'&&radio.hasHardwareAgc))gainMode=r.gainMode;
+  if(r.gain!==undefined&&Number(r.gain)>=radio.gainMin&&Number(r.gain)<=radio.gainMax){$('gain').value=r.gain;$('gainValue').textContent=`${$('gain').value} / ${radio.gainMax}`;}
+  const b=radio.bandwidthRange;
+  if(r.bandwidth!==undefined&&(Number(r.bandwidth)===0||(b&&Number(r.bandwidth)>=b[0]&&Number(r.bandwidth)<=b[1]))){analogBandwidth=Number(r.bandwidth);if(b)$('bandwidth').value=analogBandwidth||b[1];}
+  $('scale').textContent=`${Number($('floor').value)} → ${Number($('floor').value)+Number($('range').value)} dBFS`;
+ }finally{loadingProfile=false;}
+ redrawWater();draw();labels();
+}
+$('profileForget').onclick=()=>{if(!currentBoardKey)return;const all=readProfiles();delete all[currentBoardKey];try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}};
+{const aside=document.querySelector('aside');if(aside)for(const ev of ['change','input','click'])aside.addEventListener(ev,markDirty);}
 spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)*freqFactor()/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
 function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: grab the observed (nominal) frequency instead of tuning */if(calPicking&&latest){calPickOff();calGrab(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
 spec.onclick=e=>queueTune(e,spec);
