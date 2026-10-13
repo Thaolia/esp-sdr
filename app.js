@@ -22,6 +22,14 @@ function applyRadioProfile(){
 }
 let spectrumMode=false,connectionBusy=false,firmwareHandoff=false;
 let firmwareCheck=0,firmwareUpdate=null;
+// Frequency calibration: crystal error in ppm. The crystal drives both the LO
+// and the sample clock, so a single factor scales every displayed frequency
+// (true = displayed * (1 + ppm/1e6)). Correction is display-only: tuning stays
+// in whole nominal MHz, and the ppm error is far below that resolution.
+let freqCal=0;
+try{const v=Number(localStorage.getItem('espSdrFreqCal'));if(Number.isFinite(v)&&Math.abs(v)<=500)freqCal=v;}catch(e){}
+const freqFactor=()=>1+freqCal/1e6;
+let peakHzNominal=null,calObservedHz=null,calPicking=false;
 let connected=false,paused=false,latest=null,trace=null,maximum=null,previous=0,key='',running=false,tuneFrequency=2412,analogBandwidth=20;
 let loopDone=Promise.resolve();
 const spec=$('spectrum'),water=$('waterfall'),sc=spec.getContext('2d'),wc=water.getContext('2d');
@@ -60,7 +68,7 @@ window.addEventListener('mousemove',e=>{if(!drag)return;const dx=e.clientX-drag.
  const r=drag.el.getBoundingClientRect(),d=dx/r.width*(drag.b-drag.a);setView(drag.a-d,drag.b-d,connected);});
 window.addEventListener('mouseup',()=>{if(drag&&drag.moved)suppressClick=true;const was=drag&&drag.moved;drag=null;if(was&&(view.a<-1e-9||view.b>1+1e-9))retuneToView();});
 // ---- frequency axis: nice 1-2-5 ticks, shared with the spectrum grid -------
-function axisTicks(c,W){const span=(view.b-view.a)*c.rate,f0=c.frequency*1e6+(view.a-.5)*c.rate,f1=f0+span;
+function axisTicks(c,W){const k=freqFactor(),span=(view.b-view.a)*c.rate*k,f0=(c.frequency*1e6+(view.a-.5)*c.rate)*k,f1=f0+span;
  const raw=span/Math.max(2,W/110),p=10**Math.floor(Math.log10(raw)),m=raw/p,step=(m<1.5?1:m<3.5?2:m<7.5?5:10)*p,minor=step/(step/p===2?4:5);
  const x=f=>(f-f0)/span*W,major=[],minors=[];for(let f=Math.ceil(f0/minor)*minor;f<=f1;f+=minor){const r=Math.round(f/minor)*minor;if(Math.abs(r/step-Math.round(r/step))<1e-6)major.push(r);else minors.push(r);}
  return {step,major,minors,x};}
@@ -71,8 +79,60 @@ function drawAxis(c){const el=$('axisCanvas');if(!el)return;const d=Math.min(dev
  for(const f of t.major){const x=Math.round(t.x(f))+.5;g.moveTo(x,0);g.lineTo(x,9*d);}g.stroke();
  g.font=`${13*d}px Carlito,sans-serif`;g.fillStyle='#c0c9cd';g.textBaseline='bottom';
  for(const f of t.major){const s=(f/1e6).toFixed(dec),tw=g.measureText(s).width;g.fillText(s,Math.max(2*d,Math.min(W-tw-2*d,t.x(f)-tw/2)),H-3*d);}
- const mark=(fMHz,col)=>{const x=t.x(fMHz*1e6);if(x<0||x>W)return;g.fillStyle=col;g.beginPath();g.moveTo(x-5*d,0);g.lineTo(x+5*d,0);g.lineTo(x,7*d);g.closePath();g.fill();};
- mark(c.frequency,'#e0a040');if(tuneFrequency!==c.frequency)mark(tuneFrequency,'#37c964');}
+ const mark=(fMHz,col)=>{const x=t.x(fMHz*1e6*freqFactor());if(x<0||x>W)return;g.fillStyle=col;g.beginPath();g.moveTo(x-5*d,0);g.lineTo(x+5*d,0);g.lineTo(x,7*d);g.closePath();g.fill();};
+ mark(c.frequency,'#e0a040');if(tuneFrequency!==c.frequency)mark(tuneFrequency,'#37c964');drawBandTicks(t.x,W,H,d,g,(view.b-view.a)*c.rate);}
+// ---- WiFi / BLE / Bluetooth channel markers (display overlay only) ---------
+// Channel center frequencies in MHz. BLE is keyed by RF index (2402+2*i); its
+// logical channel numbers are not frequency-ordered, so advertising channels
+// (37/38/39 at 2402/2426/2480) are tagged by frequency, not by number.
+const markerBands={
+ wifi24:{color:'#37c964',chans:[...Array(13)].map((_,i)=>({n:i+1,f:2412+5*i,w:20})).concat([{n:14,f:2484,w:20}])},
+ wifi5:{color:'#4aa3ff',chans:[36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165].map(n=>({n,f:5000+5*n,w:20}))},
+ ble:{color:'#c77dff',chans:[...Array(40)].map((_,i)=>{const f=2402+2*i,adv=f===2402?37:f===2426?38:f===2480?39:0;return {n:adv||'',f,w:2,adv:!!adv};})},
+ bt:{color:'#8f9ca2',chans:[...Array(79)].map((_,i)=>({n:i,f:2402+i,w:1}))}
+};
+let markerPrefs={wifi24:true,wifi5:false,ble:false,bt:false};
+try{const v=JSON.parse(localStorage.getItem('espSdrMarkers')||'null');if(v&&typeof v==='object')markerPrefs={...markerPrefs,...v};}catch(e){}
+// Draw enabled channel markers on the spectrum: faint band tint + center line,
+// with channel numbers thinned by pixel spacing so dense bands stay legible.
+function drawChannelMarkers(c,ctx,W,H,d){
+ if(!c||!c.rate)return;
+ const k=freqFactor(),span=(view.b-view.a)*c.rate*k,f0=(c.frequency*1e6+(view.a-.5)*c.rate)*k,mapX=f=>(f-f0)/span*W;
+ ctx.save();ctx.font=`${11*d}px Carlito,sans-serif`;ctx.textBaseline='top';
+ for(const key in markerBands){
+  if(!markerPrefs[key])continue;
+  const band=markerBands[key];ctx.strokeStyle=band.color;ctx.fillStyle=band.color;
+  // Bluetooth classic (79 x 1 MHz): per-channel ticks only when zoomed in enough
+  // to stay readable; at a wide span show the whole band as one faint region
+  // with a label so an enabled checkbox is never a silent no-op.
+  if(key==='bt'&&span>40e6){const x0=mapX(2401.5e6),x1=mapX(2480.5e6);if(x1>0&&x0<W){ctx.globalAlpha=.05;ctx.fillRect(x0,0,x1-x0,H);ctx.globalAlpha=1;ctx.fillText('BT',Math.max(2,x0+3),2*d);}continue;}
+  let lastLabel=-1e9;
+  for(const ch of band.chans){
+   const x=mapX(ch.f*1e6);if(x<-20||x>W+20)continue;
+   const emph=ch.adv;
+   if(ch.w){const x0=mapX((ch.f-ch.w/2)*1e6),x1=mapX((ch.f+ch.w/2)*1e6);ctx.globalAlpha=emph?.1:.045;ctx.fillRect(x0,0,x1-x0,H);}
+   ctx.globalAlpha=emph?.6:.3;ctx.lineWidth=(emph?1.6:.8)*d;
+   const xr=Math.round(x)+.5;ctx.beginPath();ctx.moveTo(xr,0);ctx.lineTo(xr,H);ctx.stroke();
+   const text=ch.n===''?'':String(ch.n);
+   if(text&&x>=0&&x<=W&&x-lastLabel>=28*d){ctx.globalAlpha=1;const tw=ctx.measureText(text).width;ctx.fillText(text,Math.max(1,Math.min(W-tw-1,x-tw/2)),2*d);lastLabel=x;}
+  }
+ }
+ ctx.restore();
+}
+// Short colored channel ticks along the bottom edge of the frequency axis,
+// echoing the spectrum markers. Digits have no descenders, so the bottom strip
+// stays clear of the MHz labels drawn just above it.
+function drawBandTicks(mapX,W,H,d,g,span){
+ for(const key in markerBands){
+  if(!markerPrefs[key]||(key==='bt'&&span>40e6))continue;
+  g.fillStyle=markerBands[key].color;
+  for(const ch of markerBands[key].chans){
+   const x=mapX(ch.f*1e6);if(x<0||x>W)continue;
+   const t=(ch.adv?6:3)*d;g.globalAlpha=ch.adv?.95:.65;g.fillRect(Math.round(x),H-t,Math.max(1,d),t);
+  }
+ }
+ g.globalAlpha=1;
+}
 // ---- 0 Hz handling / offset LO ---------------------------------------------
 try{const v=localStorage.getItem('espSdrDcMode');if(v&&$('dcMode').querySelector(`option[value="${v}"]`))$('dcMode').value=v;}catch(e){}
 function loOffset(rate){return $('dcMode').value==='offset'?(rate>=40000000?5:2):0;}
@@ -97,7 +157,7 @@ function clear(){trace=null;maximum=null;waterHist=[];if(!keepView)view={a:0,b:1
 function resize(){const d=Math.min(devicePixelRatio||1,2);spec.width=Math.round(spec.clientWidth*d);spec.height=Math.round(spec.clientHeight*d);water.width=Math.round(water.clientWidth);water.height=Math.round(water.clientHeight);wc.fillStyle='#11191e';wc.fillRect(0,0,water.width,water.height);redrawWater();draw();labels();}
 function fmtHz(hz){const a=Math.abs(hz);return a>=1e9?(hz/1e9).toFixed(6)+' GHz':a>=1e6?(hz/1e6).toFixed(3)+' MHz':a>=1e3?(hz/1e3).toFixed(1)+' kHz':hz.toFixed(0)+' Hz';}
 function measBar(c){
- const spec=connected&&spectrumMode,n=spec?specConfig().fft:c.fft,center=c.frequency*1e6,span=c.rate;
+ const k=freqFactor(),spec=connected&&spectrumMode,n=spec?specConfig().fft:c.fft,center=c.frequency*1e6*k,span=c.rate*k;
  // Hann window: 3 dB bandwidth 1.44 bins
  const rbw=1.44*c.rate/n,top=Number($('floor').value)+Number($('range').value),div=Number($('range').value)/4;
  const det=spec?($('specDetector').value==='max'?'max-hold':'average'):'average';
@@ -110,12 +170,12 @@ function measBar(c){
 function labels(f){tuningWarning();const c=f||config();drawAxis(c);measBar(c);}
 function draw(){const w=spec.width,h=spec.height,d=Math.min(devicePixelRatio||1,2),floor=Number($('floor').value),range=Number($('range').value);sc.fillStyle='#182126';sc.fillRect(0,0,w,h);sc.lineWidth=d;sc.font=`${14*d}px Carlito,sans-serif`;
 for(let i=0;i<=4;i++){const y=i*h/4;sc.strokeStyle='#344047';sc.beginPath();sc.moveTo(0,y);sc.lineTo(w,y);sc.stroke();sc.fillStyle='#a1adb2';sc.fillText(`${Math.round(floor+range-i*range/4)}`,8*d,Math.max(16*d,y-5*d));}
-{const c=latest?{frequency:latest.frequency,rate:latest.rate}:config(),t=axisTicks(c,w);sc.strokeStyle='#202a2f';sc.beginPath();for(const f of t.minors){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();sc.strokeStyle='#33424a';sc.beginPath();for(const f of t.major){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();if(tuneFrequency!==c.frequency){const x=t.x(tuneFrequency*1e6);sc.save();sc.setLineDash([4*d,4*d]);sc.strokeStyle='#37c96490';sc.beginPath();sc.moveTo(x,0);sc.lineTo(x,h);sc.stroke();sc.restore();}drawAxis(c);}
+{const c=latest?{frequency:latest.frequency,rate:latest.rate}:config(),t=axisTicks(c,w);sc.strokeStyle='#202a2f';sc.beginPath();for(const f of t.minors){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();sc.strokeStyle='#33424a';sc.beginPath();for(const f of t.major){const x=Math.round(t.x(f))+.5;sc.moveTo(x,0);sc.lineTo(x,h);}sc.stroke();if(tuneFrequency!==c.frequency){const x=t.x(tuneFrequency*1e6*freqFactor());sc.save();sc.setLineDash([4*d,4*d]);sc.strokeStyle='#37c96490';sc.beginPath();sc.moveTo(x,0);sc.lineTo(x,h);sc.stroke();sc.restore();}drawAxis(c);drawChannelMarkers(c,sc,w,h,d);}
 function line(values,color,fill){if(!values)return;sc.beginPath();const L=values.length-1,sp=view.b-view.a,i0=Math.max(0,Math.floor(view.a*L)-1),i1=Math.min(L,Math.ceil(view.b*L)+1);for(let i=i0;i<=i1;i++){const v=values[i],x=(i/L-view.a)/sp*w,y=Math.max(0,Math.min(h,(1-(v-floor)/range)*h));if(i>i0)sc.lineTo(x,y);else sc.moveTo(x,y);}sc.strokeStyle=color;sc.lineWidth=1.2*d;sc.stroke();if(fill){sc.lineTo(w,h);sc.lineTo(0,h);sc.closePath();const g=sc.createLinearGradient(0,0,0,h);g.addColorStop(0,'#37c96445');g.addColorStop(1,'#37c96403');sc.fillStyle=g;sc.fill();}}
 if($('hold').checked)line(maximum,'#e6b969',false);line(trace,'#37c964',true);}
 function render(f){const k=[f.frequency,f.rate,f.bits,f.fft,f.bandwidth,f.gainMode,f.gainMode==='MANUAL'?f.gain:'HARDWARE'].join('/');if(key!==k){key=k;clear();}latest=f;const a=Number($('average').value);trace=f.spectrum.map((v,i)=>trace?10*Math.log10(a*10**(trace[i]/10)+(1-a)*10**(v/10)):v);maximum=f.spectrum.map((v,i)=>maximum?Math.max(maximum[i],v):v);draw();
 wc.drawImage(water,0,0,water.width,water.height-1,0,1,water.width,water.height-1);pushWater([Float32Array.from(f.spectrum)]);paintRows([waterHist[0]],0);autoScale(trace);
-$('gainStatus').textContent=f.gain_actual?.mode==='HARDWARE'?'Hardware AGC':f.gain_actual?`Manual · index ${f.gain_actual.index}`:'Update SDR firmware for gain control.';$('empty').hidden=true;labels(f);$('fpsLabel').textContent='frames/s';$('throughputLabel').textContent='kS/s delivered';$('latencyLabel').textContent='ms / capture + transfer';const now=performance.now();$('fps').textContent=previous?(1000/(now-previous)).toFixed(1):'—';previous=now;$('throughput').textContent=f.delivered_ksps.toFixed(1);$('latency').textContent=f.elapsed_ms.toFixed(1);$('peak').textContent=(f.peak_hz/1e6).toFixed(4);$('crc').textContent=`CRC OK · #${f.sequence}${f.dropped_captures?` · ${f.dropped_captures} dropped · ${f.samples} samples`:''}`;}
+$('gainStatus').textContent=f.gain_actual?.mode==='HARDWARE'?'Hardware AGC':f.gain_actual?`Manual · index ${f.gain_actual.index}`:'Update SDR firmware for gain control.';$('empty').hidden=true;labels(f);$('fpsLabel').textContent='frames/s';$('throughputLabel').textContent='kS/s delivered';$('latencyLabel').textContent='ms / capture + transfer';const now=performance.now();$('fps').textContent=previous?(1000/(now-previous)).toFixed(1):'—';previous=now;$('throughput').textContent=f.delivered_ksps.toFixed(1);$('latency').textContent=f.elapsed_ms.toFixed(1);peakHzNominal=f.peak_hz;$('peak').textContent=(f.peak_hz*freqFactor()/1e6).toFixed(4);$('crc').textContent=`CRC OK · #${f.sequence}${f.dropped_captures?` · ${f.dropped_captures} dropped · ${f.samples} samples`:''}`;}
 async function loop(){
  if(running)return loopDone;
  running=true;
@@ -175,7 +235,8 @@ function state(){
  $('openUSB').disabled=connected||$('connect').disabled||!navigator.usb;
  $('openRecent').disabled=connected||$('connect').disabled||!savedPort();
  tuningWarning();
- for(const control of document.querySelectorAll('aside input,aside select'))control.disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
+ // Channel markers (.mk) are display-only and stay usable while disconnected.
+ for(const control of document.querySelectorAll('aside input:not(.mk),aside select'))control.disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
  const specOk=connected&&radio.canStreamSpectrum;
  $('specControls').hidden=!specOk;$('specMode').disabled=!specOk||(!!radio.changingBaud||!!radio.changingGpio);
  $('iqMode').disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
@@ -200,6 +261,7 @@ function state(){
  $('status').textContent=connected?(paused?'Paused':'Receiving'):'Disconnected';
  $('connect').textContent=connected?'Disconnect':'Connect ESP-SDR';$('light').classList.toggle('on',connected&&!paused);
  $('pause').disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);$('pause').textContent=paused?'Resume':'Pause';
+ $('calFromPeak').disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
  
  for(const b of document.querySelectorAll('[data-freq]'))b.disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio)||(+b.dataset.freq===5500&&radio.family!=='C5')||!radio.validFrequency(+b.dataset.freq);
  const gainDisabled=!connected||(!!radio.changingBaud||!!radio.changingGpio)||!radio.hasGain;
@@ -391,8 +453,21 @@ $('frequency').closest('label').addEventListener('wheel',e=>{
 for(const b of document.querySelectorAll('[data-freq]'))b.onclick=()=>{$('frequency').value=b.dataset.freq;tuneFrequency=Number(b.dataset.freq);labels();};
 for(const id of ['floor','range'])$(id).oninput=()=>{$('floorValue').textContent=$('floor').value+' dBFS';$('rangeValue').textContent=$('range').value+' dB';$('scale').textContent=`${$('floor').value} → ${Number($('floor').value)+Number($('range').value)} dBFS`;redrawWater();draw();};
 $('hold').onchange=()=>{maximum=null;draw();};
-spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
-function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
+for(const key of ['wifi24','wifi5','ble','bt']){const el=$('mark'+key[0].toUpperCase()+key.slice(1));el.checked=markerPrefs[key];el.onchange=()=>{markerPrefs[key]=el.checked;try{localStorage.setItem('espSdrMarkers',JSON.stringify(markerPrefs));}catch(e){}draw();labels();};}
+// ---- frequency calibration (ppm) assistant ---------------------------------
+function fmtPpm(){if(!freqCal)return 'Calibration off';const hz=2440e6*freqCal/1e6;return `${freqCal>0?'+':''}${freqCal.toFixed(1)} ppm (${hz>=0?'+':'−'}${Math.abs(hz/1e3).toFixed(1)} kHz @ 2.44 GHz)`;}
+function applyCal(ppm){freqCal=Math.max(-500,Math.min(500,Number(ppm)||0));try{localStorage.setItem('espSdrFreqCal',String(freqCal));}catch(e){}$('calPpm').value=freqCal;$('calStatus').textContent=fmtPpm();draw();labels();}
+function calPickOff(){calPicking=false;$('calPick').setAttribute('aria-pressed','false');$('calPick').textContent='Pick on graph';}
+// Observed frequency must be the uncalibrated (nominal) value to yield absolute ppm.
+function calGrab(hz){calObservedHz=hz;$('calObserved').textContent=(hz/1e6).toFixed(4)+' MHz';$('calForm').hidden=false;if(!$('calTrue').value)$('calTrue').value=(hz*freqFactor()/1e6).toFixed(3);}
+$('calPpm').value=freqCal;$('calStatus').textContent=fmtPpm();
+$('calPpm').onchange=()=>{const v=Number($('calPpm').value);if(Number.isFinite(v))applyCal(v);};
+$('calReset').onclick=()=>{$('calForm').hidden=true;calPickOff();applyCal(0);};
+$('calFromPeak').onclick=()=>{if(peakHzNominal==null){error('No peak yet — connect and wait for a live signal.');return;}calGrab(peakHzNominal);};
+$('calApply').onclick=()=>{const trueMHz=Number($('calTrue').value);if(!Number.isFinite(trueMHz)||trueMHz<=0||!calObservedHz){error('Enter the reference true frequency in MHz.');return;}applyCal((trueMHz*1e6/calObservedHz-1)*1e6);$('calForm').hidden=true;calPickOff();error('');};
+$('calPick').onclick=()=>{calPicking=!calPicking;$('calPick').setAttribute('aria-pressed',String(calPicking));$('calPick').textContent=calPicking?'Click the peak on the graph…':'Pick on graph';};
+spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)*freqFactor()/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
+function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: grab the observed (nominal) frequency instead of tuning */if(calPicking&&latest){calPickOff();calGrab(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
 spec.onclick=e=>queueTune(e,spec);
 water.onclick=e=>queueTune(e,water);$('axisCanvas').onclick=e=>queueTune(e,$('axisCanvas'));
 new ResizeObserver(resize).observe(spec);labels();state();
@@ -475,7 +550,7 @@ function renderSpec(rows){
  {const st=specInfo&&specInfo.stats,el=$('chipStats');el.hidden=!st||performance.now()-st.t>3000;if(!el.hidden)el.textContent=`Core 0: ${st.core0.toFixed(0)} % · Core 1: ${st.dual?st.core1.toFixed(0)+' %':'off'}\nFFT coverage: ${st.coverage.toFixed(1)} % (${(st.fftsPerS/1e3).toFixed(1)} k/s)\nRAM free: ${(st.heapFree/1024).toFixed(0)} KB · Largest block: ${(st.heapLargest/1024).toFixed(0)} KB\nMax lateness: ${st.lateMax} · Skipped: ${st.abandoned}\nQueue: ${st.queue.toFixed(0)} %`;}
  $('throughput').textContent=(specCount.length*(32+nb)/1e3).toFixed(0);$('throughputLabel').textContent=`kB/s over ${radio.transport} · ${c.rate/1e6} MS/s on chip${specCov===null?'':` · FFT on ${Math.round(specCov*100)} % of samples`}`;
  $('latency').textContent=specLast?(specLast.pairs/c.rate*1e3).toFixed(2):'—';$('latencyLabel').textContent=`ms / spectrum · ${c.maxHold?'max':'mean'} of ${specLast?.ffts??'—'} FFT`;
- $('peak').textContent=((c.frequency*1e6+(peak-nb/2)*c.rate/nb)/1e6).toFixed(4);
+ {const pk=c.frequency*1e6+(peak-nb/2)*c.rate/nb;peakHzNominal=pk;$('peak').textContent=(pk*(typeof freqFactor==='function'?freqFactor():1)/1e6).toFixed(4);}
  const g=specInfo?.gain;$('gainStatus').textContent=(g?.mode==='HARDWARE'?'Hardware AGC':g?`Manual · index ${g.index}`:'');
  $('crc').textContent=`SPEC · ${radio.spectrumContinuous(Number($('rate').value),Number($('fft').value))?'continuous capture':'snapshots with gaps'} · #${specLast?.frame??0}${specLast?.drops?` · ${specLast.drops} dropped`:''}${specInfo?.crcErrors?` · ${specInfo.crcErrors} CRC err`:''}${specInfo?.hostDropped?` · ${Math.round(specInfo.hostDropped/1024)} kB skipped (page busy)`:''}`;
 }
