@@ -33,6 +33,19 @@ let peakHzNominal=null,calObservedHz=null,calPicking=false;
 // Per-board configuration profiles, keyed by USB serial (native/WebUSB) or model.
 let currentBoardKey=null,loadingProfile=false,saveTimer=0;
 let connected=false,paused=false,latest=null,trace=null,maximum=null,previous=0,key='',running=false,tuneFrequency=2412,analogBandwidth=20;
+// ---- debug / UART traffic logger (feeds the right-side panel) -------------
+// radio.command()/line() call radio.onwire, so TX/RX control lines land here.
+// The high-rate IQ path uses read() and is never logged.
+const dbg=(()=>{const el=$('debugLog'),MAX=400,sym={tx:'»',rx:'«',ev:'·'},hotTx=/^CAP\d/;let buf=[],open=false,prevConn=false;
+ const paint=l=>{const d=document.createElement('div');d.className='dbg-'+l.d;d.textContent=`${l.t} ${sym[l.d]} ${l.m}`;el.append(d);while(el.childElementCount>MAX)el.firstChild.remove();el.scrollTop=el.scrollHeight;};
+ // Drop the per-capture IQ chatter — CAP../DATA and the GAIN? probe + its echo fire every
+ // frame on the hot path. Cheap prefix test BEFORE any alloc; keeps the control-plane log readable.
+ const log=(d,m)=>{if(d==='tx'?(!m||m==='GAIN?'||hotTx.test(m)):(m.startsWith('DATA ')||m.startsWith('GAIN ')))return;const l={t:new Date().toLocaleTimeString(),d,m:(''+m).slice(0,400)};buf.push(l);if(buf.length>MAX)buf.shift();if(open)paint(l);};
+ log.setOpen=v=>{open=v;if(open){el.textContent='';for(const l of buf)paint(l);}};
+ log.clear=()=>{buf=[];el.textContent='';};
+ log.stat=()=>{const st=$('debugStat');if(!st)return;st.textContent=connected?`${radio.deviceName||'ESP32'} · ${radio.transport||'—'} · ${radio.transport==='UART'?radio.baudRate/1e6+' MBaud':radio.transport==='USB'?'USB-CDC':'—'} · drops ${radio.droppedCaptures} · CRC err ${radio.spectrumCrcErrors}`:'Disconnected';if(prevConn!==connected){prevConn=connected;log('ev',connected?`connected: ${radio.deviceName||'ESP32'}`:'disconnected');}};
+ return log;})();
+radio.onwire=(dir,msg)=>dbg(dir,msg);
 let loopDone=Promise.resolve();
 const spec=$('spectrum'),water=$('waterfall'),sc=spec.getContext('2d'),wc=water.getContext('2d');
 const lut=Array.from({length:256},(_,i)=>{const stops=[[3,8,23],[18,31,81],[38,63,153],[30,139,181],[66,213,174],[217,237,103],[255,162,61],[255,244,228]];const p=i/255*(stops.length-1),j=Math.min(stops.length-2,Math.floor(p)),t=p-j;return stops[j].map((v,k)=>Math.round(v*(1-t)+stops[j+1][k]*t));});
@@ -158,7 +171,7 @@ async function api(path,body){let value;
  return {json:async()=>value};
 }
 function error(e,communication=false){
- const box=$('error'),text=$('errorText');text.textContent=e?.message||e;box.hidden=!e;
+ const box=$('error'),text=$('errorText');text.textContent=e?.message||e;box.hidden=!e;if(e)dbg('ev','ERROR: '+(e?.message||e));
  if(e&&communication){const link=document.createElement('a');link.href='flash.html';link.textContent='Install / update ESP-SDR firmware';link.onclick=openFirmwareInstaller;text.append(' ',link);}
 }
 $('dismissError').onclick=()=>error('');
@@ -282,6 +295,7 @@ function state(){
  $('bandwidthOpen').disabled=bandwidthDisabled;$('bandwidthFilter').disabled=bandwidthDisabled;
  $('bandwidthOpen').setAttribute('aria-pressed',String(analogBandwidth===0));$('bandwidthFilter').setAttribute('aria-pressed',String(analogBandwidth!==0));
  $('bandwidth').disabled=bandwidthDisabled||analogBandwidth===0;
+ dbg.stat();
 }
 let dismissedTuningFrequency=null;
 function tuningWarning(){
@@ -538,6 +552,17 @@ $('profileForget').onclick=()=>{if(!currentBoardKey)return;const all=readProfile
  // Restore the collapsed state without animating (else the panel flashes open->shut on every reload).
  try{if(localStorage.getItem('espSdrControlsOpen')==='0'){main.style.transition='none';setControls(false);requestAnimationFrame(()=>{main.style.transition='';});}}catch(e){}
  tgl.onclick=()=>setControls(main.classList.contains('collapsed'));}
+// ---- shrinkable header ----------------------------------------------------
+{const root=document.documentElement,tgl=$('toggleHeader');
+ const setHeader=min=>{root.classList.toggle('header-min',min);tgl.setAttribute('aria-expanded',min?'false':'true');try{localStorage.setItem('espSdrHeaderMin',min?'1':'0');}catch(e){}};
+ try{if(localStorage.getItem('espSdrHeaderMin')==='1')setHeader(true);}catch(e){}
+ tgl.onclick=()=>setHeader(!root.classList.contains('header-min'));}
+// ---- debug / UART panel toggle (right column, collapsed by default) -------
+{const main=document.querySelector('main'),tgl=$('toggleDebug');
+ const setDebug=on=>{main.classList.toggle('debug-open',on);tgl.setAttribute('aria-expanded',on?'true':'false');dbg.setOpen(on);try{localStorage.setItem('espSdrDebugOpen',on?'1':'0');}catch(e){}};
+ try{if(localStorage.getItem('espSdrDebugOpen')==='1'){main.style.transition='none';setDebug(true);requestAnimationFrame(()=>{main.style.transition='';});}}catch(e){}
+ tgl.onclick=()=>setDebug(!main.classList.contains('debug-open'));
+ $('debugClear').onclick=()=>dbg.clear();}
 spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)*freqFactor()/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
 function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: grab the observed (nominal) frequency instead of tuning */if(calPicking&&latest){calPickOff();calGrab(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
 spec.onclick=e=>queueTune(e,spec);

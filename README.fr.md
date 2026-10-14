@@ -87,10 +87,20 @@ Dispositions récentes du visualiseur (sur ordinateur, largeur ≥ 851 px) :
   graphes pour répartir leur hauteur ; double-cliquez-la pour revenir à la
   répartition par défaut. Le réglage est mémorisé et reste toujours borné à
   l'écran (il ne réintroduit jamais de défilement).
+- **En-tête rétrécissable** — le chevron `⌃` dans l'en-tête réduit la barre du
+  haut (le sous-titre se masque) pour laisser plus de hauteur au spectre et au
+  waterfall. L'état est mémorisé.
+- **Panneau de debug / trafic UART** (à droite, replié par défaut) — ouvrez-le
+  avec le bouton terminal de l'en-tête pour voir le trafic série de contrôle
+  TX (`»`) / RX (`«`) — commandes et réponses échangées avec la carte (`INFO`,
+  `FREQ`, `OK`, etc.) — ainsi que les events de connexion et les erreurs. Une
+  ligne de stats résume transport, baud, trames perdues et erreurs CRC. Le flux
+  IQ haut débit (en-têtes `CAP`/`DATA` par trame) n'est **pas** journalisé, pour
+  ne rien coûter sur le chemin critique. Bouton **Clear** pour vider le journal.
 
 Sur mobile (largeur ≤ 850 px), le panneau de contrôles s'empile sous l'en-tête
-comme auparavant ; le chevron et la poignée de redimensionnement ne sont pas
-affichés.
+comme auparavant ; les chevrons, le bouton debug, la poignée de redimensionnement
+et le panneau de debug ne sont pas affichés.
 
 ## Configuration sur ordinateur
 
