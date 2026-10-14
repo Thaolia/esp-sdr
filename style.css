@@ -2,7 +2,11 @@
 
 @media(max-width:850px){.pair{grid-column:1/-1}.presets{align-self:end}.actions{align-self:center}.brand h1{white-space:nowrap;font-size:18px}.brand{gap:8px}.mark{font-size:28px}.connection{gap:6px}header{padding:12px}.connection button{padding:9px 10px}}
 input[type=file]{display:block;width:100%;font-size:14px;margin-top:8px}.note{margin-top:12px}
-@media(min-width:851px){aside{max-height:calc(100vh - 90px);overflow-y:auto;scrollbar-color:#394348 #11191e}.display{align-self:start}}
+/* Desktop: right column bounded to the viewport (min-height, not height, so a too-short screen scrolls gracefully instead of clipping a canvas); spectrum/waterfall flex; panel collapse = grid 340px->0. */
+@media(min-width:851px){aside{max-height:calc(100vh - 90px);overflow-y:auto;scrollbar-color:#394348 #11191e}.display{align-self:start;min-height:calc(100vh - 90px);display:flex;flex-direction:column}.display>*{flex:0 0 auto}.display>.chart{flex:1 1 0;min-height:0;display:flex;flex-direction:column}#spectrum,#waterfall{flex:1 1 0;min-height:80px;height:auto}main{transition:grid-template-columns .25s ease}main.collapsed{grid-template-columns:0 minmax(0,1fr)}main.collapsed #controls{padding-left:0;padding-right:0;border-right:0;overflow:hidden}}
+@media(min-width:851px) and (prefers-reduced-motion:reduce){main{transition:none}}
+#toggleControls{display:inline-flex;align-items:center;justify-content:center;padding:8px 10px}#toggleControls svg{transition:transform .25s ease}#toggleControls[aria-expanded=false] svg{transform:rotate(180deg)}@media(prefers-reduced-motion:reduce){#toggleControls svg{transition:none}}
+@media(max-width:850px){#splitter,#toggleControls{display:none}}
 
 /* ESPARGOS site palette; the transparent logo sits on its dark body color. */
 .brand-logo{display:block;width:175px;height:35px;object-fit:contain;background:#11191e}header{background:#11191e}.brand h1{font-size:18px}

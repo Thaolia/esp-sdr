@@ -531,11 +531,20 @@ function loadProfile(){
 }
 $('profileForget').onclick=()=>{if(!currentBoardKey)return;const all=readProfiles();delete all[currentBoardKey];try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}};
 {const aside=document.querySelector('aside');if(aside)for(const ev of ['change','input','click'])aside.addEventListener(ev,markDirty);}
+// ---- controls panel (left column) collapse --------------------------------
+// The toggle lives in the header (outside the aside) so it doesn't trip markDirty.
+{const main=document.querySelector('main'),tgl=$('toggleControls');
+ const setControls=open=>{main.classList.toggle('collapsed',!open);tgl.setAttribute('aria-expanded',open?'true':'false');try{localStorage.setItem('espSdrControlsOpen',open?'1':'0');}catch(e){}};
+ // Restore the collapsed state without animating (else the panel flashes open->shut on every reload).
+ try{if(localStorage.getItem('espSdrControlsOpen')==='0'){main.style.transition='none';setControls(false);requestAnimationFrame(()=>{main.style.transition='';});}}catch(e){}
+ tgl.onclick=()=>setControls(main.classList.contains('collapsed'));}
 spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)*freqFactor()/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
 function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: grab the observed (nominal) frequency instead of tuning */if(calPicking&&latest){calPickOff();calGrab(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
 spec.onclick=e=>queueTune(e,spec);
 water.onclick=e=>queueTune(e,water);$('axisCanvas').onclick=e=>queueTune(e,$('axisCanvas'));
-new ResizeObserver(resize).observe(spec);labels();state();
+// Coalesce resizes (window + panel-collapse animation) onto one frame:
+// resize() clears then repaints the waterfall, so firing it every frame makes it flicker.
+let roRaf=0;new ResizeObserver(()=>{if(roRaf)return;roRaf=requestAnimationFrame(()=>{roRaf=0;resize();});}).observe(spec);labels();state();
 
 // Keep a frame-selection boundary for future signal-based triggering.
 function selectRxFrame(f){
@@ -643,13 +652,18 @@ function autoScale(values){
 }
 $('autoscale').onchange=()=>{autoT=0;autoPk=null;};
 // ---- spectrum / waterfall splitter ----------------------------------------
-{const sp=$('splitter'),def=[220,380],set=(hs,hw)=>{spec.style.height=hs+'px';water.style.height=hw+'px';resize();redrawWater();};
- try{const v=JSON.parse(localStorage.getItem('espSdrSplit')||'null');if(Array.isArray(v)&&v.length===2&&v.every(n=>Number.isFinite(n)&&n>=80&&n<=1200))set(v[0],v[1]);}catch(e){}
+// Split spectrum/waterfall by flex-grow weights (not absolute px heights):
+// the sum is capped by the viewport-bounded column, so dragging never reintroduces
+// scroll. A block's weight = desired canvas height + its chrome (charthead, axis,
+// meas), so the canvas lands exactly on the target value (80px floor).
+{const sp=$('splitter'),specChart=spec.closest('.chart'),waterChart=water.closest('.chart'),def=[220,380],
+  set=(hs,hw)=>{const cs=specChart.clientHeight-spec.clientHeight,cw=waterChart.clientHeight-water.clientHeight;specChart.style.flexGrow=hs+cs;waterChart.style.flexGrow=hw+cw;resize();redrawWater();};
+ let v=def;try{const s=JSON.parse(localStorage.getItem('espSdrSplitRatio')||'null');if(Array.isArray(s)&&s.length===2&&s.every(n=>Number.isFinite(n)&&n>0))v=s;}catch(e){}set(v[0],v[1]);
  let sd=null;sp.addEventListener('pointerdown',e=>{sd={y:e.clientY,hs:spec.clientHeight,hw:water.clientHeight};sp.setPointerCapture(e.pointerId);sp.classList.add('drag');e.preventDefault();});
  sp.addEventListener('pointermove',e=>{if(!sd)return;const tot=sd.hs+sd.hw,hs=Math.max(80,Math.min(tot-80,sd.hs+e.clientY-sd.y));set(hs,tot-hs);});
  sp.addEventListener('pointercancel',()=>{sd=null;sp.classList.remove('drag');});
- sp.addEventListener('pointerup',()=>{if(!sd)return;sd=null;sp.classList.remove('drag');try{localStorage.setItem('espSdrSplit',JSON.stringify([spec.clientHeight,water.clientHeight]));}catch(e){}});
- sp.addEventListener('dblclick',()=>{set(def[0],def[1]);try{localStorage.removeItem('espSdrSplit');}catch(e){}});}
+ sp.addEventListener('pointerup',()=>{if(!sd)return;sd=null;sp.classList.remove('drag');try{localStorage.setItem('espSdrSplitRatio',JSON.stringify([spec.clientHeight,water.clientHeight]));}catch(e){}});
+ sp.addEventListener('dblclick',()=>{set(def[0],def[1]);try{localStorage.removeItem('espSdrSplitRatio');}catch(e){}});}
 
 // Start without a click: connect to the remembered port as soon as the page
 // loads and whenever a device is plugged in (only ports this site was granted).
