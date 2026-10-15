@@ -96,7 +96,7 @@ function firmwareUpdateStatus(installed,manifest){
   :{status:'current',message:''};
 }
 class BurstSerialRadio {
- constructor(){this.maxSamples=16380;this.captureSamples=null;this.droppedCaptures=0;this.spectrumCrcErrors=0;this.baudRate=2000000;this.transport=null;this.supportsBaudChange=false;this.changingBaud=false;this.hasGpio=false;this.gpioPins=[];this.firmwareVersion=null;this.gainMin=0;this.gainMax=0;this.gainStep=1;this.bandwidthRange=null;this.sampleBits=[8,10];this.family="C5";this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=false;this.hasFreqk=false;this.hasTemp=false;this.hasFwopt=false;this.hasSweep=false;this.hasCspec=false;this.hasCgrid=false;this.hasCont=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;this.rxRates=[80000000,40000000,20000000,10000000,8000000,4000000];this.port=null;this.queue=[];this.queued=0;this.wake=null;this.reader=null;this.writer=null;this.failed=null;this.tail=Promise.resolve();this.sequence=0;this.last=null;this.frequency=null;this.filter=null;this.analogFilter=null;this.bandwidth=null;this.gainSetting=null;}
+ constructor(){this.maxSamples=16380;this.captureSamples=null;this.droppedCaptures=0;this.spectrumCrcErrors=0;this.baudRate=2000000;this.transport=null;this.supportsBaudChange=false;this.changingBaud=false;this.hasGpio=false;this.gpioPins=[];this.firmwareVersion=null;this.gainMin=0;this.gainMax=0;this.gainStep=1;this.bandwidthRange=null;this.sampleBits=[8,10];this.family="C5";this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=false;this.hasFreqk=false;this.hasTemp=false;this.hasFwopt=false;this.hasSweep=false;this.hasCspec=false;this.hasCgrid=false;this.hasCont=false;this.hasGfsk=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;this.rxRates=[80000000,40000000,20000000,10000000,8000000,4000000];this.port=null;this.queue=[];this.queued=0;this.wake=null;this.reader=null;this.writer=null;this.failed=null;this.tail=Promise.resolve();this.sequence=0;this.last=null;this.frequency=null;this.filter=null;this.analogFilter=null;this.bandwidth=null;this.gainSetting=null;}
  run(f){const p=this.tail.then(f);this.tail=p.catch(()=>{});return p;}
  async pump(){try{for(;;){const {value,done}=await this.reader.read();if(done)break;if(value){this.queue.push(value);this.queued+=value.length;if(this.lossy&&this.queued>1048576){while(this.queued>262144){const b=this.queue.shift();this.queued-=b.length;this.hostDropped+=b.length;}}if(this.queued>2*1024*1024)throw Error('Serial receive queue overflow');if(this.wake)this.wake();}}}catch(e){this.failed=e;}finally{this.failed ||= Error('Device disconnected');if(this.wake)this.wake();}}
  async read(n,deadline=performance.now()+5000,idleMs=Infinity){let idleDeadline=performance.now()+idleMs;const out=new Uint8Array(n);let offset=0;while(offset<n){if(this.queued){const b=this.queue[0],k=Math.min(n-offset,b.length);out.set(b.subarray(0,k),offset);offset+=k;this.queued-=k;idleDeadline=performance.now()+idleMs;if(k===b.length)this.queue.shift();else this.queue[0]=b.subarray(k);continue;}if(this.failed)throw this.failed;const ms=Math.min(deadline,idleDeadline)-performance.now();if(ms<=0)throw Object.assign(Error('Serial response timed out'),{code:'SERIAL_TIMEOUT'});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.wake=null;reject(Object.assign(Error('Serial response timed out'),{code:'SERIAL_TIMEOUT'}));},ms);this.wake=()=>{clearTimeout(timer);this.wake=null;resolve();};});}return out;}
@@ -196,7 +196,7 @@ class BurstSerialRadio {
  get canStreamSpectrum(){return this.hasSpec&&!!this.specCapabilities?.transports.includes(this.transport);}
  spectrumContinuous(rate,n){const p=this.spectrumProfiles(rate).find(p=>p[2]===n);return p?.length===6?!!p[5]:!!this.specCapabilities?.continuous;}
  spectrumProfiles(rate){return this.specCapabilities?.profiles.filter(p=>p[0]===rate)||[];}
- async negotiate(){await this.command('INFO');this.identity=await this.line();this.applyIdentity(this.identity);await this.command('CAPS');const caps=await this.line('',1024);this.supportsBaudChange=false;this.transport=null;if(caps.split(' ').includes('UARTBAUD')){await this.command('TRANSPORT?');const t=/^TRANSPORT (UART|USB) (\d+)$/.exec(await this.line());if(!t||(t[1]==='UART'?Number(t[2])!==this.baudRate:Number(t[2])!==0))throw Error('Invalid serial transport response');this.transport=t[1];this.supportsBaudChange=this.transport==='UART';}if(this.family==='S3')this.rxRates=[80000000,...(caps.split(' ').includes('RX40')?[40000000]:[]),...(caps.split(' ').includes('RX16')?[16000000]:[])];this.hasSerialLease=caps.split(' ').some(c=>c==='SERIALLEASE'||c==='DUALSERIAL');this.hasExtendedTune=caps.split(' ').includes('TUNEEXT');this.tuneRange=null;if(this.hasExtendedTune){await this.command('RANGE?');const h=(await this.line('RANGE ')).split(' '),lo=Number(h[1]),hi=Number(h[2]);if(h.length!==4||!Number.isInteger(lo)||!Number.isInteger(hi)||lo<100||hi>6000||lo>=hi||h[3]!=='1')throw Error('Invalid tuning range');this.tuneRange=[lo,hi];}this.hasAnalogFilter=caps.split(' ').includes('LPFANA');this.hasAnalogBandwidth=this.family!=='S3'&&caps.split(' ').includes('ALPF');this.hasFilter12=this.family!=='S3'&&caps.split(' ').includes('LPF12');this.hasFilter=caps.split(' ').includes('LPF')||this.hasAnalogFilter;this.hasGain=caps.split(' ').includes('GAIN');this.hasSpec=caps.split(' ').includes('SPEC');this.hasSpecN=caps.split(' ').includes('SPECN');this.hasSpecStats=caps.split(' ').includes('SPECSTAT');this.hasHardwareAgc=caps.split(' ').includes('HWAGC');this.hasBigcap=caps.split(' ').includes('BIGCAP');this.hasFreqk=caps.split(' ').includes('FREQK');this.hasTemp=caps.split(' ').includes('TEMP');this.hasFwopt=caps.split(' ').includes('FWOPT');this.hasSweep=caps.split(' ').includes('SWEEP');this.hasCspec=caps.split(' ').includes('CSPEC');this.hasCgrid=caps.split(' ').includes('CGRID');this.hasCont=caps.split(' ').includes('CONT');if(caps.split(' ').includes('RXLIMITS')){await this.command('LIMITS?');this.applyLimits(await this.line('LIMITS ',4096));}else{await this.command('GAIN?');const g=(await this.line('GAIN ')).split(' ');this.applyLimits('LIMITS '+JSON.stringify({gain:[Number(g[3]),Number(g[4]),1],bandwidth:null,rates:this.rxRates,bits:[8,10]}));}await this.negotiateVersion(caps);await this.negotiateFwopt();await this.negotiateGpio(caps);await this.negotiateSpectrum(caps);this.deviceName=this.family==='ESP32'?'ESP32':'ESP32-'+this.family;return {identity:this.identity,port:this.deviceName,family:this.family,filter:this.hasFilter};}
+ async negotiate(){await this.command('INFO');this.identity=await this.line();this.applyIdentity(this.identity);await this.command('CAPS');const caps=await this.line('',1024);this.supportsBaudChange=false;this.transport=null;if(caps.split(' ').includes('UARTBAUD')){await this.command('TRANSPORT?');const t=/^TRANSPORT (UART|USB) (\d+)$/.exec(await this.line());if(!t||(t[1]==='UART'?Number(t[2])!==this.baudRate:Number(t[2])!==0))throw Error('Invalid serial transport response');this.transport=t[1];this.supportsBaudChange=this.transport==='UART';}if(this.family==='S3')this.rxRates=[80000000,...(caps.split(' ').includes('RX40')?[40000000]:[]),...(caps.split(' ').includes('RX16')?[16000000]:[])];this.hasSerialLease=caps.split(' ').some(c=>c==='SERIALLEASE'||c==='DUALSERIAL');this.hasExtendedTune=caps.split(' ').includes('TUNEEXT');this.tuneRange=null;if(this.hasExtendedTune){await this.command('RANGE?');const h=(await this.line('RANGE ')).split(' '),lo=Number(h[1]),hi=Number(h[2]);if(h.length!==4||!Number.isInteger(lo)||!Number.isInteger(hi)||lo<100||hi>6000||lo>=hi||h[3]!=='1')throw Error('Invalid tuning range');this.tuneRange=[lo,hi];}this.hasAnalogFilter=caps.split(' ').includes('LPFANA');this.hasAnalogBandwidth=this.family!=='S3'&&caps.split(' ').includes('ALPF');this.hasFilter12=this.family!=='S3'&&caps.split(' ').includes('LPF12');this.hasFilter=caps.split(' ').includes('LPF')||this.hasAnalogFilter;this.hasGain=caps.split(' ').includes('GAIN');this.hasSpec=caps.split(' ').includes('SPEC');this.hasSpecN=caps.split(' ').includes('SPECN');this.hasSpecStats=caps.split(' ').includes('SPECSTAT');this.hasHardwareAgc=caps.split(' ').includes('HWAGC');this.hasBigcap=caps.split(' ').includes('BIGCAP');this.hasFreqk=caps.split(' ').includes('FREQK');this.hasTemp=caps.split(' ').includes('TEMP');this.hasFwopt=caps.split(' ').includes('FWOPT');this.hasSweep=caps.split(' ').includes('SWEEP');this.hasCspec=caps.split(' ').includes('CSPEC');this.hasCgrid=caps.split(' ').includes('CGRID');this.hasCont=caps.split(' ').includes('CONT');this.hasGfsk=caps.split(' ').includes('GFSKPKT');if(caps.split(' ').includes('RXLIMITS')){await this.command('LIMITS?');this.applyLimits(await this.line('LIMITS ',4096));}else{await this.command('GAIN?');const g=(await this.line('GAIN ')).split(' ');this.applyLimits('LIMITS '+JSON.stringify({gain:[Number(g[3]),Number(g[4]),1],bandwidth:null,rates:this.rxRates,bits:[8,10]}));}await this.negotiateVersion(caps);await this.negotiateFwopt();await this.negotiateGpio(caps);await this.negotiateSpectrum(caps);this.deviceName=this.family==='ESP32'?'ESP32':'ESP32-'+this.family;return {identity:this.identity,port:this.deviceName,family:this.family,filter:this.hasFilter};}
  async negotiateVersion(caps){
   this.firmwareVersion={status:'missing'};
   if(!caps.split(' ').includes('VERSION'))return;
@@ -281,7 +281,7 @@ class BurstSerialRadio {
   const fs=limits.freqStepHz;this.freqStepHz=Number.isInteger(fs)&&fs>0&&fs<=1000000&&1000000%fs===0?fs:null;
   const lm=limits.lockMHz;this.lockRanges=Array.isArray(lm)&&lm.length&&lm.every(r=>Array.isArray(r)&&r.length===2&&Number.isInteger(r[0])&&Number.isInteger(r[1])&&r[0]<r[1])?lm:null;
  }
- async close(){if(this.writer&&this.reader&&!this.failed&&this.hasFilter){try{await this.command('LPF AUTO');await this.line('OK');}catch(e){/* Disconnect still releases USB after a lost response. */}}if(this.writer&&this.reader&&!this.failed&&this.hasAnalogBandwidth){try{await this.command('ALPF AUTO');await this.line('OK');}catch(e){}}if(this.hasSerialLease&&this.writer&&this.reader&&!this.failed){try{await this.command('RELEASE');await this.line('OK');}catch(e){/* Idle ownership expires if the port disappears. */}}this.firmwareVersion=null;this.hasGpio=false;this.gpioPins=[];this.hasSerialLease=false;this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=this.hasFreqk=this.hasTemp=this.hasFwopt=this.hasSweep=this.hasCspec=this.hasCgrid=this.hasCont=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;await this.closePort();this.transport=null;this.supportsBaudChange=false;}
+ async close(){if(this.writer&&this.reader&&!this.failed&&this.hasFilter){try{await this.command('LPF AUTO');await this.line('OK');}catch(e){/* Disconnect still releases USB after a lost response. */}}if(this.writer&&this.reader&&!this.failed&&this.hasAnalogBandwidth){try{await this.command('ALPF AUTO');await this.line('OK');}catch(e){}}if(this.hasSerialLease&&this.writer&&this.reader&&!this.failed){try{await this.command('RELEASE');await this.line('OK');}catch(e){/* Idle ownership expires if the port disappears. */}}this.firmwareVersion=null;this.hasGpio=false;this.gpioPins=[];this.hasSerialLease=false;this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=this.hasFreqk=this.hasTemp=this.hasFwopt=this.hasSweep=this.hasCspec=this.hasCgrid=this.hasCont=this.hasGfsk=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;await this.closePort();this.transport=null;this.supportsBaudChange=false;}
  validFrequency(f){
   if(typeof f!=='number'||!Number.isFinite(f))return false;
   // With FREQK the grid is 1 kHz; otherwise whole MHz (same as the historical integer check).
@@ -608,6 +608,59 @@ BurstSerialRadio.prototype.cspec=function(c,onLine,shouldStop){return this.run(a
      const h=hdr.exec(header);
      if(h)await this.read(Number(h[3])*nfft*bpp,deadline,500);
      else if(performance.now()>deadline)throw Error('CSPEC drain timeout');
+    }
+   }catch(error){this.failed=error;}
+  }
+ }
+});};
+
+// ESPsoup GFSK/BLE packet catcher. "GFSK rate_idx R kbps mode len" (mode 0 = BLE: on-device GFSK
+// demod + per-channel de-whitening from FREQ + length from the header + CRC-24 checked). Reply
+// "OK GFSK fin R fout sps mode sync nbits maxerr len chan words", then per packet
+// "GPK seq t_us n flags rssi*10 cfo dev errs crc32" + n bytes, then "END GFSK ...". The n bytes are
+// the de-whitened PDU (2-byte header + payload + 3-byte CRC-24, n = payload_len + 5); crc32 is the
+// transport integrity of those bytes; flags bit0 = BLE CRC-24 ok, bit2 = BLE PDU. Needs a fixed
+// gain (the AGC changes gain inside a packet). Same no-lossy / frame-aware drain as cspec().
+BurstSerialRadio.prototype.gfsk=function(c,onPacket,shouldStop){return this.run(async()=>{
+ if(!this.hasGfsk)throw Error('GFSK packet capture is unavailable on this firmware.');
+ const rateIdx=Number(c.rateIdx),R=Number(c.R),len=Number(c.len);
+ if(![2,3,4,5].includes(rateIdx)||![1,2,4].includes(R)||!Number.isInteger(len)||len<8||len>255)throw Error('Invalid GFSK settings');
+ await this.tune(c.frequency,0);
+ const gain=await this.setGain(c.gainMode,c.gain);
+ const info={gain,crcErrors:0,report:null};
+ const hdr=/^GPK (\d+) (\d+) (\d+) (\d+) (-?\d+) (-?\d+) (-?\d+) (\d+) ([0-9a-fA-F]{1,8})$/;
+ let stopping=false,count=0,ended=false,started=false;
+ try{
+  await this.command(`GFSK ${rateIdx} ${R} 1000 0 ${len}`);
+  const head=(await this.line('OK GFSK',160)).split(' ');
+  if(head.length<12||head[6]!=='0')throw Error('Unexpected GFSK header');
+  started=true;
+  for(;;){
+   if((++count&15)===0)await yieldTask();
+   if(!stopping&&shouldStop()){stopping=true;await this.command('');}
+   let header;
+   try{header=await this.line('',200);}
+   catch(e){if(e.code==='SERIAL_TIMEOUT'&&!this.failed&&!stopping)continue;throw e;} // quiet RF: keep waiting
+   if(header.startsWith('END GFSK')){ended=true;info.report=header;info.why=header.split(' ')[9]||'';return info;}
+   if(header.startsWith('ERR '))throw Error(header);
+   const h=hdr.exec(header);
+   if(!h)throw Object.assign(Error('Invalid GFSK header: '+header),{code:'CAPTURE_DAMAGED'});
+   const n=Number(h[3]);
+   const payload=await this.read(n,performance.now()+5000,1000);
+   if(crc32(payload)!==parseInt(h[9],16)){this.spectrumCrcErrors++;info.crcErrors++;this.onCaptureError?.();continue;}
+   const flags=Number(h[4]);
+   onPacket({seq:Number(h[1]),t:Number(h[2]),n,flags,crcOk:!!(flags&1),blePdu:!!(flags&4),rssi:Number(h[5])/10,cfo:Number(h[6]),dev:Number(h[7]),errs:Number(h[8])},payload,info);
+  }
+ }finally{
+  if(!ended&&!this.failed&&this.writer&&started){
+   try{
+    await this.command('');const deadline=performance.now()+3000;
+    while(!ended){
+     const header=await this.line('',200);
+     if(header.startsWith('END GFSK')){ended=true;break;}
+     const h=hdr.exec(header);
+     if(h)await this.read(Number(h[3]),deadline,1000);
+     else if(performance.now()>deadline)throw Error('GFSK drain timeout');
     }
    }catch(error){this.failed=error;}
   }

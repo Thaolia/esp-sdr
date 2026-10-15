@@ -23,7 +23,7 @@ function applyRadioProfile(){
 // Capture mode: 'iq' burst snapshots, 'spec' shared on-chip spectrum stream,
 // 'cspec' ESPsoup continuous waterfall, 'sweep' ESPsoup wideband panorama.
 let captureMode='iq',connectionBusy=false,firmwareHandoff=false;
-const isSpec=()=>captureMode==='spec',isCspec=()=>captureMode==='cspec',isSweep=()=>captureMode==='sweep';
+const isSpec=()=>captureMode==='spec',isCspec=()=>captureMode==='cspec',isSweep=()=>captureMode==='sweep',isBle=()=>captureMode==='ble';
 let firmwareCheck=0,firmwareUpdate=null;
 // Frequency calibration: crystal error in ppm. The crystal drives both the LO
 // and the sample clock, so a single factor scales every displayed frequency
@@ -231,6 +231,7 @@ async function loop(){
     else if(isSpec()&&radio.hasSpec)await specLoop();
     else if(isCspec()&&radio.hasCspec)await cspecLoop();
     else if(isSweep()&&radio.hasSweep)await sweepLoop();
+    else if(isBle()&&radio.hasGfsk)await bleLoop();
     else{
     const f=await(await api('frame',config())).json();
     if(connected&&!paused&&!radio.changingBaud&&selectRxFrame(f))render(f);
@@ -286,12 +287,14 @@ function state(){
  for(const control of document.querySelectorAll('aside input:not(.mk),aside select'))control.disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
  const busy=(!!radio.changingBaud||!!radio.changingGpio);
  // Capture-mode availability + the mode bar (lives in the spectrum chart, outside the aside).
- const canSpec=connected&&radio.canStreamSpectrum,canCspec=connected&&radio.hasCspec,canSweep=connected&&radio.hasSweep;
+ const canSpec=connected&&radio.canStreamSpectrum,canCspec=connected&&radio.hasCspec,canSweep=connected&&radio.hasSweep,canBle=connected&&radio.hasGfsk;
  {const gf=$('toggleGapFill');if(gf){gf.hidden=!(connected&&(canSpec||canCspec));gf.textContent=radioB?'Remove gap-fill device':'Add gap-fill device…';}updateDualStatus();}
- if((isSpec()&&!canSpec)||(isCspec()&&!canCspec)||(isSweep()&&!canSweep))captureMode='iq';
- $('modeSpec').hidden=!canSpec;$('modeCspec').hidden=!canCspec;$('modeSweep').hidden=!canSweep;
- for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep']]){$(id).setAttribute('aria-pressed',String(captureMode===m));$(id).disabled=!connected||busy;}
- $('iqControls').hidden=captureMode!=='iq';$('specOptions').hidden=!isSpec();$('sweepOptions').hidden=!isSweep();$('cspecOptions').hidden=!isCspec();
+ if((isSpec()&&!canSpec)||(isCspec()&&!canCspec)||(isSweep()&&!canSweep)||(isBle()&&!canBle))captureMode='iq';
+ $('modeSpec').hidden=!canSpec;$('modeCspec').hidden=!canCspec;$('modeSweep').hidden=!canSweep;$('modeBle').hidden=!canBle;
+ for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep'],['modeBle','ble']]){$(id).setAttribute('aria-pressed',String(captureMode===m));$(id).disabled=!connected||busy;}
+ $('iqControls').hidden=captureMode!=='iq';$('specOptions').hidden=!isSpec();$('sweepOptions').hidden=!isSweep();$('cspecOptions').hidden=!isCspec();$('bleOptions').hidden=!isBle();
+ // BLE scan replaces the spectrum/waterfall charts with the device table.
+ {const ble=isBle(),sc=$('spectrum').closest('.chart'),wc2=$('waterfall').closest('.chart');if(sc)sc.hidden=ble;if(wc2)wc2.hidden=ble;$('splitter').hidden=ble;$('blePanel').hidden=!ble||!connected;}
  // #fftControl is shared by iq and spec; park it in whichever of the two panels is showing.
  if(captureMode==='iq'||isSpec()){const options=$(isSpec()?'specOptions':'iqControls');if($('fftControl').parentElement!==options)options.prepend($('fftControl'));}
  $('specRow').disabled=!canSpec||!isSpec()||busy;$('specDetector').disabled=$('specRow').disabled;
@@ -536,7 +539,8 @@ function collectProfile(){return {freqCal,markers:{...markerPrefs},
  display:{floor:$('floor').value,range:$('range').value,average:$('average').value,hold:$('hold').checked,autoscale:$('autoscale').checked},
  capture:{mode:captureMode,specRow:$('specRow').value,specDetector:$('specDetector').value,
   cspecFft:$('cspecFft').value,cspecDetector:$('cspecDetector').value,cspecNavg:$('cspecNavg').value,
-  sweepF0:$('sweepF0').value,sweepF1:$('sweepF1').value,sweepStep:$('sweepStep').value,sweepFft:$('sweepFft').value,sweepNavg:$('sweepNavg').value},
+  sweepF0:$('sweepF0').value,sweepF1:$('sweepF1').value,sweepStep:$('sweepStep').value,sweepFft:$('sweepFft').value,sweepNavg:$('sweepNavg').value,
+  bleChannel:$('bleChannel').value,bleSource:$('bleSource').value},
  radio:{frequency:tuneFrequency,rate:$('rate').value,fft:$('fft').value,bits:$('bits').value,gainMode,gain:$('gain').value,bandwidth:analogBandwidth}};}
 function saveProfile(){if(!currentBoardKey)return;const all=readProfiles();all[currentBoardKey]=collectProfile();try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}}
 function markDirty(){if(loadingProfile||!connected||!currentBoardKey)return;clearTimeout(saveTimer);saveTimer=setTimeout(saveProfile,500);}
@@ -558,12 +562,12 @@ function loadProfile(){
   if(typeof d.hold==='boolean')$('hold').checked=d.hold;
   if(typeof d.autoscale==='boolean')$('autoscale').checked=d.autoscale;
   const cap=p.capture||{};
-  const modeOk=m=>m==='iq'||(m==='spec'&&radio.canStreamSpectrum)||(m==='cspec'&&radio.hasCspec)||(m==='sweep'&&radio.hasSweep);
+  const modeOk=m=>m==='iq'||(m==='spec'&&radio.canStreamSpectrum)||(m==='cspec'&&radio.hasCspec)||(m==='sweep'&&radio.hasSweep)||(m==='ble'&&radio.hasGfsk);
   if(typeof cap.mode==='string'&&modeOk(cap.mode))captureMode=cap.mode;
   else if(typeof cap.mode==='boolean')captureMode=cap.mode&&radio.canStreamSpectrum?'spec':'iq';
   const setSel=(id,v)=>{if(v!==undefined&&[...$(id).options].some(o=>o.value===String(v)))$(id).value=String(v);};
   setSel('cspecFft',cap.cspecFft);setSel('cspecDetector',cap.cspecDetector);setSel('cspecNavg',cap.cspecNavg);
-  setSel('sweepFft',cap.sweepFft);setSel('sweepNavg',cap.sweepNavg);
+  setSel('sweepFft',cap.sweepFft);setSel('sweepNavg',cap.sweepNavg);setSel('bleChannel',cap.bleChannel);setSel('bleSource',cap.bleSource);
   for(const [id,v] of [['sweepF0',cap.sweepF0],['sweepF1',cap.sweepF1],['sweepStep',cap.sweepStep]])if(Number.isFinite(Number(v))&&v!=='')$(id).value=String(Number(v));
   if(cap.specRow!==undefined&&[...$('specRow').options].some(o=>o.value===String(cap.specRow)))$('specRow').value=String(cap.specRow);
   if(cap.specDetector!==undefined&&[...$('specDetector').options].some(o=>o.value===String(cap.specDetector)))$('specDetector').value=String(cap.specDetector);
@@ -857,6 +861,57 @@ async function disconnectB(){
  updateDualStatus();state();
  if(b)await b.run(()=>b.close()).catch(()=>{});
 }
+// ---- BLE advertising scanner: on-device GFSK catcher or raw-I/Q decode -> one device table ---
+// Both sources feed parseBlePdu (ble.js) and the same bleDevices map. Address is often a rotating
+// random one (shown in the type column); a name only appears when the device advertises it.
+const bleDevices=new Map(); // address -> {type,name,rssi,last,count,pdu,src}
+let bleRAF=0,bleDirty=false;
+function bleChannelFreq(ch){return ch===37?2402:ch===39?2480:2426;}
+function bleConfig(){
+ const channel=Number($('bleChannel').value);
+ const gain=Math.min(Math.max(Number($('gain').value)||60,radio.gainMin||0),radio.gainMax||77);
+ return {channel,frequency:bleChannelFreq(channel),source:$('bleSource').value,rateIdx:4,R:2,len:48,gainMode:'MANUAL',gain};
+}
+function bleEscape(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function upsertBle(p,rssi,src){
+ if(!p||!p.address||!p.crcOk)return;
+ const d=bleDevices.get(p.address)||{name:'',count:0};
+ d.count++;d.rssi=rssi;d.last=performance.now();d.type=p.addrType;d.pdu=p.pduName;d.src=src;if(p.name)d.name=p.name;
+ bleDevices.set(p.address,d);bleDirty=true;
+ if(!bleRAF)bleRAF=requestAnimationFrame(bleFrame);
+}
+function bleFrame(){bleRAF=0;if(bleDirty){bleDirty=false;renderBleTable();}if(connected&&!paused&&isBle())bleRAF=requestAnimationFrame(bleFrame);}
+function renderBleTable(){
+ if(!isBle())return;
+ const now=performance.now(),body=$('bleBody');body.textContent='';
+ for(const d of [...bleDevices.entries()].sort((a,b)=>b[1].rssi-a[1].rssi)){
+  const [addr,v]=d,age=(now-v.last)/1000,tr=document.createElement('tr');
+  tr.innerHTML=`<td>${addr}</td><td class="ble-type">${v.type||''}</td><td>${v.name?bleEscape(v.name):''}</td><td class="num">${v.rssi.toFixed(1)}</td><td class="num">${age<1.5?'now':age<120?age.toFixed(0)+'s':Math.round(age/60)+'m'}</td><td class="num">${v.count}</td>`;
+  body.append(tr);
+ }
+ $('bleEmpty').hidden=bleDevices.size>0;
+ $('bleHead').textContent=`BLE devices · ${bleDevices.size} on ch ${$('bleChannel').value}`;
+}
+async function bleLoop(){
+ const c=bleConfig();
+ if(!bleRAF)bleRAF=requestAnimationFrame(bleFrame);
+ const changed=()=>{const m=bleConfig();return !isBle()||m.channel!==c.channel||m.source!==c.source;};
+ if(c.source==='iq'){await bleIqScanLoop(c,changed);return;}
+ await radio.gfsk(c,(meta,payload)=>{if(changed()||!meta.crcOk||!meta.blePdu)return;const p=parseBlePdu(payload);if(p){p.crcOk=true;upsertBle(p,meta.rssi,'device');}},
+  ()=>!connected||paused||changed());
+}
+async function bleIqScanLoop(c,changed){
+ // Repeated BIGCAP captures decoded on the host (demonstration route): one packet per window, so
+ // it finds fewer devices than the continuous on-device catcher, but proves BLE is recoverable
+ // straight from the I/Q. 4 MS/s gives the longest BIGCAP window (~8 ms) for a better hit chance.
+ while(connected&&!paused&&!changed()){
+  let cap;
+  try{cap=await radio.capture({frequency:c.frequency,rate:4000000,bits:8,fft:16384,bandwidth:0,gainMode:'MANUAL',gain:c.gain,trigger:{mode:'free'}});}
+  catch(e){if(radio.failed)throw e;await new Promise(r=>setTimeout(r,80));continue;}
+  const p=bleDecodeIq(cap.iq,4000000,c.channel);
+  if(p&&p.crcOk)upsertBle(p,p.rssi_dbfs??0,'iq');
+ }
+}
 // ---- ESPsoup wideband panorama (SWEEP) -------------------------------------
 // One pass f0..f1 per call; the outer loop re-issues it, one waterfall row per pass.
 const SWEEP_OFFSET=40; // shift the arbitrary-reference dB into the dBFS display window
@@ -910,6 +965,7 @@ function setCaptureMode(m){
  if(m==='spec'&&!radio.canStreamSpectrum)return;
  if(m==='cspec'&&!radio.hasCspec)return;
  if(m==='sweep'&&!radio.hasSweep)return;
+ if(m==='ble'&&!radio.hasGfsk)return;
  captureMode=m;
  // Re-align the shared band when entering a merge mode so a board B added earlier (e.g. while
  // in I/Q) starts merging instead of idling on a profile mismatch. No-op without B.
@@ -917,7 +973,9 @@ function setCaptureMode(m){
  // The mode bar sits outside the aside, so its change is not auto-saved by the aside listener.
  markDirty();state();labels();clear();
 }
-for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep']])$(id).onclick=()=>setCaptureMode(m);
+for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep'],['modeBle','ble']])$(id).onclick=()=>setCaptureMode(m);
+$('bleClear').onclick=()=>{bleDevices.clear();renderBleTable();};
+for(const id of ['bleChannel','bleSource'])$(id).onchange=()=>{state();labels();};
 // Auto scale: floor a little under the noise (20th percentile), top a little
 // above the strongest bin; applied at most twice a second, smoothed, without
 // clearing the waterfall.

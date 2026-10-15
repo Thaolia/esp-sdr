@@ -104,6 +104,24 @@ and **Live waterfall** modes (both boards on the same centre / rate / FFT).
 Coherent raw I/Q cannot be stitched across two boards (independent crystals); combining is for
 the power spectrum / waterfall only.
 
+### BLE advertising scanner
+
+**BLE scan** (shown when the firmware advertises `GFSKPKT`) listens to one advertising channel
+(37 / 38 / 39, i.e. 2402 / 2426 / 2480 MHz) and lists the devices it hears — address, address
+type, name (when advertised), RSSI, last-seen and packet count. Two decode sources:
+
+- **On-device catcher** — the firmware demodulates GFSK, de-whitens and checks the CRC-24 on the
+  ESP and streams decoded advertising PDUs; the viewer parses them. This is the reliable path
+  (continuous, gap-free).
+- **From raw I/Q** — the viewer captures I/Q and decodes the packet itself (discriminator →
+  access-address lock → de-whitening → CRC-24 → parse). It proves BLE is recoverable straight from
+  the samples, but decodes one packet per capture window, so it finds fewer devices.
+
+Honest limits: the address is **often a random, rotating one** (BLE privacy) — the *type* column
+says which are public (stable) vs random/resolvable; a **name only shows when the device
+advertises it** (a passive RX-only receiver cannot solicit scan responses); the scan uses a
+**fixed gain** (the AGC changes gain inside a packet). Reception is passive.
+
 With other firmware (stock ESP-SDR, other chips) these modes and controls stay hidden and
 the viewer behaves as before.
 

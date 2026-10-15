@@ -151,6 +151,25 @@ continu** (les deux cartes sur mêmes centre / rate / FFT).
 L'I/Q brut cohérent ne peut pas être raccordé entre deux cartes (cristaux indépendants) : la
 combinaison ne concerne que le spectre de puissance / waterfall.
 
+### Scanner BLE advertising
+
+**BLE scan** (affiché si le firmware annonce `GFSKPKT`) écoute un canal d'advertising (37 / 38 /
+39, soit 2402 / 2426 / 2480 MHz) et liste les devices entendus — adresse, type d'adresse, nom
+(si advertisé), RSSI, dernière vue et nombre de paquets. Deux sources de décodage :
+
+- **Catcher on-device** — le firmware démodule le GFSK, dé-whitene et vérifie le CRC-24 sur l'ESP
+  et streame les PDU d'advertising décodées ; le visualiseur les parse. C'est la voie fiable
+  (continue, sans gaps).
+- **Depuis l'I/Q brut** — le visualiseur capture de l'I/Q et décode lui-même le paquet
+  (discriminateur → verrou sur l'adresse d'accès → dé-whitening → CRC-24 → parse). Ça prouve que le
+  BLE se récupère directement depuis les échantillons, mais décode un paquet par fenêtre de
+  capture, donc trouve moins de devices.
+
+Limites honnêtes : l'adresse est **souvent aléatoire et rotative** (vie privée BLE) — la colonne
+*type* indique lesquelles sont publiques (stables) vs random/resolvable ; un **nom n'apparaît que
+si le device l'advertise** (un récepteur passif RX-only ne peut pas solliciter de scan response) ;
+le scan utilise un **gain fixe** (l'AGC change le gain dans le paquet). La réception est passive.
+
 Avec un autre firmware (ESP-SDR standard, autres puces), ces modes et réglages restent
 simplement masqués — le visualiseur se comporte comme avant.
 
