@@ -130,6 +130,27 @@ visualiseur expose en plus :
   moteur de capture (`ENGINE`), rafraîchis uniquement hors streaming (une ligne de commande
   arrêterait un flux SPEC / CSPEC / SWEEP).
 
+### Combiner deux cartes (waterfall sans gaps)
+
+Les cartes à snapshots (C5, ESP32, S2) analysent la bande par rafales, avec des gaps entre
+elles. On peut ajouter une **deuxième carte** pour combler ces gaps : menu de connexion →
+**Add gap-fill device…**. La deuxième carte (B) recopie la bande de la carte principale, et
+les deux spectres sont fusionnés sur une grille de temps commune — un gap de l'une est couvert
+par l'autre. Une pastille dans l'en-tête du spectre indique l'état de B ; B est optionnelle et
+retombe en « carte principale seule » à la moindre erreur (reconnexion silencieuse), sans
+jamais interrompre la principale. La fusion s'applique aux modes **Spectre** et **Waterfall
+continu** (les deux cartes sur mêmes centre / rate / FFT).
+
+- **S3 + C5** — le S3 stream déjà en continu : le fusionner avec un C5 donne un waterfall sans
+  gaps à 2,4 GHz. Hors de la plage du S3, le C5 stream seul.
+- **Deux C5** — en Waterfall continu, le visualiseur pilote en plus les blocs de la deuxième
+  carte pour les entrelacer avec la première (ESPsoup `CGRID` / `CADJ`), affiché
+  *grid-lock (experimental)*. Le pilotage est prouvé sûr en cours de flux ; son gain exact de
+  comblement se mesure au mieux avec deux cartes C5 physiques.
+
+L'I/Q brut cohérent ne peut pas être raccordé entre deux cartes (cristaux indépendants) : la
+combinaison ne concerne que le spectre de puissance / waterfall.
+
 Avec un autre firmware (ESP-SDR standard, autres puces), ces modes et réglages restent
 simplement masqués — le visualiseur se comporte comme avant.
 

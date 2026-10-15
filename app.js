@@ -36,6 +36,8 @@ let peakHzNominal=null,calObservedHz=null,calPicking=false;
 // Per-board configuration profiles, keyed by USB serial (native/WebUSB) or model.
 let currentBoardKey=null,loadingProfile=false,saveTimer=0;
 let connected=false,paused=false,latest=null,trace=null,maximum=null,previous=0,key='',running=false,tuneFrequency=2412,analogBandwidth=20;
+// Dual-device gap-fill state (second board B mirrors A's band; see dualStreamLoop below).
+let radioB=null,bPort=null,dualOn=false,dualMerger=null,dualCfg=null,dualRAF=0,dualBState='',dualRate={a:[],b:[],m:[]},bRetryTimer=0;
 // ---- debug / UART traffic logger (feeds the right-side panel) -------------
 // radio.command()/line() call radio.onwire, so TX/RX control lines land here.
 // The high-rate IQ path uses read() and is never logged.
@@ -225,7 +227,8 @@ async function loop(){
  try{
   while(connected&&!paused){
    try{
-    if(isSpec()&&radio.hasSpec)await specLoop();
+    if(dualActive()&&(radio.hasSpec||radio.hasCspec))await dualStreamLoop();
+    else if(isSpec()&&radio.hasSpec)await specLoop();
     else if(isCspec()&&radio.hasCspec)await cspecLoop();
     else if(isSweep()&&radio.hasSweep)await sweepLoop();
     else{
@@ -237,7 +240,7 @@ async function loop(){
     if(radio.changingBaud)break;
     paused=true;
     const disconnected=!!radio.failed;
-    if(disconnected){connected=false;await radio.run(()=>radio.close()).catch(()=>{});}
+    if(disconnected){connected=false;if(radioB)await disconnectB();await radio.run(()=>radio.close()).catch(()=>{});}
     state();
     error(disconnected?e:`${e?.message||e} Change the settings and select Resume.`,disconnected);
     break;
@@ -284,6 +287,7 @@ function state(){
  const busy=(!!radio.changingBaud||!!radio.changingGpio);
  // Capture-mode availability + the mode bar (lives in the spectrum chart, outside the aside).
  const canSpec=connected&&radio.canStreamSpectrum,canCspec=connected&&radio.hasCspec,canSweep=connected&&radio.hasSweep;
+ {const gf=$('toggleGapFill');if(gf){gf.hidden=!(connected&&(canSpec||canCspec));gf.textContent=radioB?'Remove gap-fill device':'Add gap-fill device…';}updateDualStatus();}
  if((isSpec()&&!canSpec)||(isCspec()&&!canCspec)||(isSweep()&&!canSweep))captureMode='iq';
  $('modeSpec').hidden=!canSpec;$('modeCspec').hidden=!canCspec;$('modeSweep').hidden=!canSweep;
  for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep']]){$(id).setAttribute('aria-pressed',String(captureMode===m));$(id).disabled=!connected||busy;}
@@ -458,6 +462,7 @@ $('choosePort').onkeydown=e=>{if(e.key==='ArrowDown'){e.preventDefault();openCon
 $('openRecent').onclick=()=>{closeConnectMenu(true);return $('connect').onclick();};
 $('openOther').onclick=()=>{closeConnectMenu(true);return $('connect').onclick({choosePort:true,kind:'webserial'});};
 $('openUSB').onclick=()=>{closeConnectMenu(true);return $('connect').onclick({choosePort:true,kind:'webusb'});};
+$('toggleGapFill').onclick=()=>{closeConnectMenu(true);return radioB?disconnectB():connectB();};
 $('openFlasher').onclick=openFirmwareInstaller;
 $('updateFirmware').onclick=openFirmwareInstaller;
 $('connectMenu').onkeydown=e=>{
@@ -493,7 +498,7 @@ async function openFirmwareInstaller(event){
  }catch(e){installer?.close();firmwareHandoff=false;error(e);}
  finally{connectionBusy=false;state();}
 }
-$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){await disconnectRadio();currentBoardKey=null;const pb=$('profileBox');if(pb)pb.hidden=true;}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();captureMode=radio.canStreamSpectrum?'spec':'iq';applyRadioProfile();loadProfile();refreshDiag(true);paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
+$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){if(radioB)await disconnectB();await disconnectRadio();currentBoardKey=null;const pb=$('profileBox');if(pb)pb.hidden=true;}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();captureMode=radio.canStreamSpectrum?'spec':'iq';applyRadioProfile();loadProfile();refreshDiag(true);paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
 $('pause').onclick=()=>{paused=!paused;previous=0;state();if(!paused){error('');loop();}};$('clear').onclick=clear;
 for(const id of ['rate','bits','fft'])$(id).onchange=()=>{state();labels();};
 $('frequency').onchange=()=>{tuneFrequency=Number($('frequency').value);labels();};
@@ -650,10 +655,10 @@ async function specLoop(){
   // hidden tab: no animation frames, so bound the backlog here
   if(specPending.length>1024)specPending.splice(0,specPending.length-512);
   if(specCount.length>4096){const t=performance.now()-1000;let i=0;while(i<specCount.length&&specCount[i]<t)i++;specCount.splice(0,i);}
- },()=>!connected||paused||!isSpec()||changed());
+ },()=>!connected||paused||!isSpec()||dualActive()||changed());
  if(!changed()&&isSpec()){queueRow();if(specPending.length&&!specRAF)specRAF=requestAnimationFrame(specFrame);}
 }
-function specFrame(){specRAF=0;if(specPending.length){const rows=specPending;specPending=[];renderSpec(rows);}if(connected&&!paused&&isSpec())specRAF=requestAnimationFrame(specFrame);}
+function specFrame(){specRAF=0;if(specPending.length){const rows=specPending;specPending=[];renderSpec(rows);}if(connected&&!paused&&isSpec()&&!dualActive())specRAF=requestAnimationFrame(specFrame);}
 function renderSpec(rows){
  const c=specConfig(),k=specDisplayKey(c);
  rows=rows.filter(row=>row.key===k);
@@ -706,9 +711,9 @@ async function cspecLoop(){
   for(let j=0;j<nfft;j++)disp[j]=(line[j]-12*sh)/2-128;
   cspecPending.push(disp);
   if(cspecPending.length>2048)cspecPending.splice(0,cspecPending.length-512);
- },()=>!connected||paused||!isCspec()||changed());
+ },()=>!connected||paused||!isCspec()||dualActive()||changed());
 }
-function cspecFrame(){cspecRAF=0;if(cspecPending.length){const rows=cspecPending;cspecPending=[];renderCspec(rows);}if(connected&&!paused&&isCspec())cspecRAF=requestAnimationFrame(cspecFrame);}
+function cspecFrame(){cspecRAF=0;if(cspecPending.length){const rows=cspecPending;cspecPending=[];renderCspec(rows);}if(connected&&!paused&&isCspec()&&!dualActive())cspecRAF=requestAnimationFrame(cspecFrame);}
 function renderCspec(rows){
  if(!isCspec()||!rows.length)return;
  const c=cspecConfig();if(!c)return;
@@ -731,6 +736,126 @@ function renderCspec(rows){
  $('latency').textContent='0';$('latencyLabel').textContent=`gap-free · nfft ${nfft}`;
  let peak=0;for(let j=1;j<nfft;j++)if(cur[j]>cur[peak])peak=j;const pk=c.frequency*1e6+(peak-nfft/2)*c.rate/nfft;peakHzNominal=pk;$('peak').textContent=(pk*freqFactor()/1e6).toFixed(4);
  $('crc').textContent=`CSPEC · continuous · ${radio.spectrumCrcErrors?radio.spectrumCrcErrors+' CRC err':'OK'}`;
+}
+// ---- Dual-device gap-fill: a second board (B) mirrors A's band; both feed a shared ----
+// RowMerger so a gap in one board's coverage is filled by the other. Only the power-spectrum
+// streams (SPEC, CSPEC) merge. B drops to A-only on any B error (silent reconnect); A is never
+// torn down by B. The merge is free-running here (gaps beat through phase), so coverage is
+// best-effort; a guaranteed 100% needs two CGRID boards (grid lock, a later step).
+function dualActive(){return dualOn&&!!radioB&&(isSpec()||isCspec());}
+function rate1s(arr){const t=performance.now()-1000;while(arr.length&&arr[0]<t)arr.shift();return arr.length;}
+async function dualStreamLoop(){
+ const spec=isSpec(),c=spec?specConfig():cspecConfig();
+ if(!c){await new Promise(r=>setTimeout(r,200));return;}
+ const nb=spec?c.fft:c.nfft,maxHold=spec?c.maxHold:($('cspecDetector').value==='max'),rowMs=(spec?Number($('specRow').value):33)||33,dcMode=$('dcMode').value;
+ const bOk=!!radioB&&!radioB.failed&&radioB.validFrequency(c.frequency)&&(spec?radioB.canStreamSpectrum&&radioB.spectrumProfiles(c.rate).some(p=>p[2]===nb):radioB.hasCspec&&radioB.rxRates.includes(c.rate));
+ // Experimental grid-lock: with two CGRID boards in CSPEC, steer B's block phase to the
+ // midpoint of A's (CADJ, proven safe mid-run) so they cover each other's gaps. Phase is
+ // measured from block-arrival times; the gap-closing efficacy needs two physical CGRID
+ // boards to validate. Inactive for S3 + C5 (the S3 has no CGRID), so it can never hurt it.
+ const lock=bOk&&!spec&&!!radioB&&radioB.hasCgrid&&radio.hasCgrid;
+ const blk={aT:0,bT:0,P:0},seqSeen={a:-1,b:-1};let steerTimer=0;
+ dualMerger=new RowMerger(nb,maxHold,rowMs);
+ dualCfg={c,nb,key:spec?specDisplayKey(c):['cspec',c.frequency,c.rate,c.nfft,c.mode].join('/')};
+ dualRate={a:[],b:[],m:[]};dualBState=bOk?(lock?'grid-lock':'merging'):'idle';updateDualStatus();
+ const changed=()=>{if(!dualActive())return true;const m=spec?specConfig():cspecConfig();if(!m)return true;return spec?($('dcMode').value!==dcMode||m.frequency!==c.frequency||m.gainMode!==c.gainMode||m.gain!==c.gain||m.bandwidth!==c.bandwidth||m.maxHold!==c.maxHold||m.rate!==c.rate||m.fft!==c.fft||Number($('specRow').value)!==rowMs):(m.frequency!==c.frequency||m.rate!==c.rate||m.nfft!==c.nfft||m.navg!==c.navg||m.mode!==c.mode||m.gainMode!==c.gainMode||m.gain!==c.gain);};
+ if(!dualRAF)dualRAF=requestAnimationFrame(dualFrame);
+ // Record each board's block-arrival time (on CSPEC seq change) and A's mean block period,
+ // the inputs to the CADJ steering loop below.
+ const mark=(src,meta)=>{if(!lock||!meta)return;const now=performance.now();if(src==='A'){if(meta.seq!==seqSeen.a){seqSeen.a=meta.seq;if(blk.aT){const d=now-blk.aT;blk.P=blk.P?blk.P*0.8+d*0.2:d;}blk.aT=now;}}else if(meta.seq!==seqSeen.b){seqSeen.b=meta.seq;blk.bT=now;}};
+ const feed=src=>spec
+  ?(h,bins)=>{if(changed())return;dualMerger.add(specToDbfs(bins,h.step,nb),h.ffts,performance.now(),src);dualRate[src==='A'?'a':'b'].push(performance.now());}
+  :(line,meta)=>{if(changed())return;mark(src,meta);const sh=meta.sh,disp=new Float32Array(nb);for(let j=0;j<nb;j++)disp[j]=(line[j]-12*sh)/2-128;dualMerger.add(disp,1,performance.now(),src);dualRate[src==='A'?'a':'b'].push(performance.now());};
+ let aErr=null,stopAll=false;
+ const aStop=()=>stopAll||!connected||paused||changed();
+ const bStop=()=>stopAll||!dualOn||!radioB||radioB.failed||!connected||paused||changed();
+ const aStream=(spec?radio.spec(c,feed('A'),aStop):radio.cspec(c,feed('A'),aStop)).catch(e=>{aErr=e;stopAll=true;});
+ let bStream=Promise.resolve();
+ if(bOk){const gs=radioB.gainStep||1,gB=radioB.gainMin+Math.round((Math.max(radioB.gainMin,Math.min(radioB.gainMax,c.gain))-radioB.gainMin)/gs)*gs,cB={...c,gain:gB};bStream=(spec?radioB.spec(cB,feed('B'),bStop):radioB.cspec(cB,feed('B'),bStop)).catch(()=>{dualBState=radioB&&radioB.failed?'reconnecting':'idle';updateDualStatus();if(radioB&&radioB.failed)scheduleBRetry();});}
+ // CADJ steering: nudge B toward a half-period offset from A. A direct writer write (not
+ // run()-serialized) reaches B mid-stream without stopping it; the low 0.3 gain and the 5%
+ // deadband keep the slow loop from ringing on host-timing jitter.
+ if(lock)steerTimer=setInterval(()=>{if(!dualActive()||!radioB||radioB.failed||!blk.P||!blk.aT||!blk.bT)return;const P=blk.P;let err=P/2-((blk.bT-blk.aT)%P+P)%P;if(err>P/2)err-=P;if(err<-P/2)err+=P;if(Math.abs(err)<P*0.05)return;radioB.command('CADJ '+Math.round(Math.max(-P/2,Math.min(P/2,err*0.3))*1000)).catch(()=>{});},350);
+ try{await Promise.all([aStream,bStream]);}finally{if(steerTimer)clearInterval(steerTimer);}
+ if(aErr)throw aErr;
+}
+function dualFrame(){dualRAF=0;if(dualMerger){const rows=dualMerger.drain();if(rows.length){for(let i=0;i<rows.length;i++)dualRate.m.push(performance.now());renderMerged(rows);}}if(connected&&!paused&&dualActive())dualRAF=requestAnimationFrame(dualFrame);}
+function renderMerged(rows){
+ if(!dualActive()||!dualCfg||!rows.length)return;
+ const {c,nb,key:k}=dualCfg;
+ if(key!==k){key=k;clear();}
+ const batch=new SpectrumAccumulator(nb,false);for(const r of rows)batch.add(r.bins,r.weight);const cur=batch.finish().bins;
+ const a=Number($('average').value);if(trace&&trace.length!==nb){trace=null;maximum=null;}
+ trace=Array.from(cur,(v,i)=>trace?10*Math.log10(a*10**(trace[i]/10)+(1-a)*10**(v/10)):v);
+ if(!maximum||maximum.length!==nb)maximum=Array(nb).fill(-Infinity);
+ for(const r of rows)for(let i=0;i<nb;i++){const p=r.peak?r.peak[i]:r.bins[i];if(p>maximum[i])maximum[i]=p;}
+ latest={frequency:c.frequency,rate:c.rate,fft:nb,spectrum:trace};draw();
+ const n=Math.min(rows.length,water.height);
+ wc.drawImage(water,0,0,water.width,water.height-n,0,n,water.width,water.height-n);
+ const newest=[];for(let r=0;r<n;r++)newest.push(rows[rows.length-1-r].bins);pushWater(newest);paintRows(newest,0);
+ autoScale(trace);$('empty').hidden=true;labels(latest);
+ $('fps').textContent=`${rate1s(dualRate.m)}`;$('fpsLabel').textContent='rows/s (merged)';
+ $('throughputLabel').textContent=`gap-fill · ${c.rate/1e6} MS/s`;$('throughput').textContent='';
+ updateDualStatus();
+}
+function updateDualStatus(){
+ const el=$('dualStatus');if(!el)return;
+ if(!dualOn||!radioB){el.hidden=true;return;}
+ el.hidden=false;
+ const name=radioB.deviceName||('ESP32-'+(radioB.family||'?'));
+ const st=!(isSpec()||isCspec())?'switch to Spectrum or Live waterfall to merge'
+  :dualBState==='reconnecting'?'reconnecting…':dualBState==='failed'?'disconnected'
+  :dualBState==='idle'?'idle · band not supported by B':dualBState==='grid-lock'?'grid-lock (experimental)':'merging';
+ el.textContent=`Gap-fill · ${name}: ${st}`;
+ el.title=`A ${rate1s(dualRate.a)}/s + B ${rate1s(dualRate.b)}/s → merged ${rate1s(dualRate.m)}/s\n`+
+  `Free-running merge fills most gaps; a guaranteed 100 % needs two CGRID boards (grid lock).`;
+}
+function scheduleBRetry(){
+ clearTimeout(bRetryTimer);if(!dualOn||!bPort)return;
+ bRetryTimer=setTimeout(async()=>{
+  if(!dualOn||!bPort)return;
+  try{const b=new BurstSerialRadio();await b.connect({port:bPort});if(!b.canStreamSpectrum&&!b.hasCspec){await b.close().catch(()=>{});throw Error('no spectrum stream');}radioB=b;dualBState='merging';}
+  catch(e){dualBState='failed';scheduleBRetry();}
+  updateDualStatus();
+ },1500);
+}
+async function connectB(ev){
+ if(connectionBusy||radio.changingBaud)return;
+ if(!connected){error('Connect the main device before adding a gap-fill device.');return;}
+ connectionBusy=true;state();
+ try{
+  const port=await SerialConnection.requestPort(ev?.kind);
+  if(!port)return;
+  const b=new BurstSerialRadio();
+  await b.connect({port});
+  if(!b.canStreamSpectrum&&!b.hasCspec){await b.close().catch(()=>{});throw Error('This device has no spectrum stream to merge; choose a board that streams SPEC or CSPEC.');}
+  radioB=b;bPort=port;dualOn=true;dualBState='merging';
+  alignDualBand();
+  error('');
+ }catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}
+ finally{connectionBusy=false;updateDualStatus();state();}
+}
+// SPEC can only merge where A and B share a (rate, nfft) spectrum profile (e.g. an S3 only
+// offers nfft 256 at 80 MS/s, so a C5 defaulting to a larger FFT would leave B idle). Snap the
+// band to the largest shared profile, preferring the current rate. CSPEC needs no alignment:
+// it is C5-only, so both boards share the same rates and FFT range.
+function alignDualBand(){
+ if(!dualOn||!radioB||!isSpec())return;
+ const A=radio.specCapabilities?.profiles||[],B=radioB.specCapabilities?.profiles||[],common=[];
+ for(const pa of A)for(const pb of B)if(pa[0]===pb[0]&&pa[2]===pb[2])common.push([pa[0],pa[2]]);
+ if(!common.length)return; // no shared SPEC profile: B idles, the status chip says so
+ const curRate=Number($('rate').value),atCur=common.filter(x=>x[0]===curRate);
+ const pick=(atCur.length?atCur:common).sort((a,b)=>b[1]-a[1])[0];
+ let moved=false;
+ if(Number($('rate').value)!==pick[0]){$('rate').value=String(pick[0]);moved=true;}
+ if(Number($('fft').value)!==pick[1]){$('fft').value=String(pick[1]);moved=true;}
+ if(moved){state();labels();}
+}
+async function disconnectB(){
+ clearTimeout(bRetryTimer);dualOn=false;const b=radioB;radioB=null;bPort=null;dualBState='';
+ if(dualRAF){cancelAnimationFrame(dualRAF);dualRAF=0;}
+ updateDualStatus();state();
+ if(b)await b.run(()=>b.close()).catch(()=>{});
 }
 // ---- ESPsoup wideband panorama (SWEEP) -------------------------------------
 // One pass f0..f1 per call; the outer loop re-issues it, one waterfall row per pass.
@@ -786,6 +911,9 @@ function setCaptureMode(m){
  if(m==='cspec'&&!radio.hasCspec)return;
  if(m==='sweep'&&!radio.hasSweep)return;
  captureMode=m;
+ // Re-align the shared band when entering a merge mode so a board B added earlier (e.g. while
+ // in I/Q) starts merging instead of idling on a profile mismatch. No-op without B.
+ alignDualBand();
  // The mode bar sits outside the aside, so its change is not auto-saved by the aside listener.
  markDirty();state();labels();clear();
 }

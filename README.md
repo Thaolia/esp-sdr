@@ -84,6 +84,26 @@ also exposes:
   (`ENGINE`), refreshed only while not streaming (any command line would stop a running
   SPEC / CSPEC / SWEEP).
 
+### Combine two boards (gap-free waterfall)
+
+Snapshot boards (C5, ESP32, S2) analyse the band in bursts, leaving gaps between them. You
+can add a **second board** to fill those gaps: open the connection menu and choose **Add
+gap-fill device…**. The second board (B) mirrors the main board's band, and both spectra are
+merged on a shared time grid, so a gap in one board is covered by the other. A small chip in
+the spectrum header shows B's state; B is optional and drops to main-only on any error
+(silent reconnect) — it never interrupts the main board. Merging applies to the **Spectrum**
+and **Live waterfall** modes (both boards on the same centre / rate / FFT).
+
+- **S3 + C5** — the S3 already streams continuously, so merging it with a C5 gives a gap-free
+  waterfall at 2.4 GHz. Outside the S3's range the C5 streams alone.
+- **Two C5** — in Live waterfall the viewer additionally steers the second board's blocks to
+  interleave with the first (ESPsoup `CGRID` / `CADJ`), shown as *grid-lock (experimental)*.
+  The steering is proven safe mid-stream; its exact gap-closing figure is best measured on two
+  physical C5 boards.
+
+Coherent raw I/Q cannot be stitched across two boards (independent crystals); combining is for
+the power spectrum / waterfall only.
+
 With other firmware (stock ESP-SDR, other chips) these modes and controls stay hidden and
 the viewer behaves as before.
 
