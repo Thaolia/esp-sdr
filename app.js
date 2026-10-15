@@ -20,7 +20,10 @@ function applyRadioProfile(){
  if(!radio.validFrequency(tuneFrequency)){tuneFrequency=2412;$('frequency').value='2412';}
  state();labels();
 }
-let spectrumMode=false,connectionBusy=false,firmwareHandoff=false;
+// Capture mode: 'iq' burst snapshots, 'spec' shared on-chip spectrum stream,
+// 'cspec' ESPsoup continuous waterfall, 'sweep' ESPsoup wideband panorama.
+let captureMode='iq',connectionBusy=false,firmwareHandoff=false;
+const isSpec=()=>captureMode==='spec',isCspec=()=>captureMode==='cspec',isSweep=()=>captureMode==='sweep';
 let firmwareCheck=0,firmwareUpdate=null;
 // Frequency calibration: crystal error in ppm. The crystal drives both the LO
 // and the sample clock, so a single factor scales every displayed frequency
@@ -40,12 +43,23 @@ const dbg=(()=>{const el=$('debugLog'),MAX=400,sym={tx:'»',rx:'«',ev:'·'},hot
  const paint=l=>{const d=document.createElement('div');d.className='dbg-'+l.d;d.textContent=`${l.t} ${sym[l.d]} ${l.m}`;el.append(d);while(el.childElementCount>MAX)el.firstChild.remove();el.scrollTop=el.scrollHeight;};
  // Drop the per-capture IQ chatter — CAP../DATA and the GAIN? probe + its echo fire every
  // frame on the hot path. Cheap prefix test BEFORE any alloc; keeps the control-plane log readable.
- const log=(d,m)=>{if(d==='tx'?(!m||m==='GAIN?'||hotTx.test(m)):(m.startsWith('DATA ')||m.startsWith('GAIN ')))return;const l={t:new Date().toLocaleTimeString(),d,m:(''+m).slice(0,400)};buf.push(l);if(buf.length>MAX)buf.shift();if(open)paint(l);};
+ const hotRx=/^(DATA |DATAT |GAIN |SWP |SPL |BLK |PKT |CSL |VFL |GPK )/;
+ const log=(d,m)=>{if(d==='tx'?(!m||m==='GAIN?'||hotTx.test(m)):hotRx.test(m))return;const l={t:new Date().toLocaleTimeString(),d,m:(''+m).slice(0,400)};buf.push(l);if(buf.length>MAX)buf.shift();if(open)paint(l);};
  log.setOpen=v=>{open=v;if(open){el.textContent='';for(const l of buf)paint(l);}};
  log.clear=()=>{buf=[];el.textContent='';};
- log.stat=()=>{const st=$('debugStat');if(!st)return;st.textContent=connected?`${radio.deviceName||'ESP32'} · ${radio.transport||'—'} · ${radio.transport==='UART'?radio.baudRate/1e6+' MBaud':radio.transport==='USB'?'USB-CDC':'—'} · drops ${radio.droppedCaptures} · CRC err ${radio.spectrumCrcErrors}`:'Disconnected';if(prevConn!==connected){prevConn=connected;log('ev',connected?`connected: ${radio.deviceName||'ESP32'}`:'disconnected');}};
+ log.stat=()=>{const st=$('debugStat');if(!st)return;
+  if(!connected)st.textContent='Disconnected';
+  else{const d=deviceDiag,p=[`${radio.deviceName||'ESP32'} · ${radio.transport||'—'} · ${radio.transport==='UART'?radio.baudRate/1e6+' MBaud':radio.transport==='USB'?'USB-CDC':'—'}`,`drops ${radio.droppedCaptures} · CRC err ${radio.spectrumCrcErrors}`];
+   if(d?.fwopt||radio.fwopt)p.push(d?.fwopt||radio.fwopt);
+   if(d?.temp!=null)p.push(`${d.temp.toFixed(1)} °C`);
+   if(d?.heapFree!=null)p.push(`heap ${(d.heapFree/1024).toFixed(0)}k · max ${(d.heapLargest/1024).toFixed(0)}k`);
+   if(d?.tunem!=null)p.push(`TUNEM ${d.tunem}`);
+   if(d?.engine)p.push(`engine ${d.engine}`);
+   st.textContent=p.join(' · ');}
+  if(prevConn!==connected){prevConn=connected;log('ev',connected?`connected: ${radio.deviceName||'ESP32'}`:'disconnected');}};
  return log;})();
 radio.onwire=(dir,msg)=>dbg(dir,msg);
+let deviceDiag=null; // last ESPsoup diagnostics snapshot (FWOPT/TEMP/HEAP/TUNEM/ENGINE)
 let loopDone=Promise.resolve();
 const spec=$('spectrum'),water=$('waterfall'),sc=spec.getContext('2d'),wc=water.getContext('2d');
 const lut=Array.from({length:256},(_,i)=>{const stops=[[3,8,23],[18,31,81],[38,63,153],[30,139,181],[66,213,174],[217,237,103],[255,162,61],[255,244,228]];const p=i/255*(stops.length-1),j=Math.min(stops.length-2,Math.floor(p)),t=p-j;return stops[j].map((v,k)=>Math.round(v*(1-t)+stops[j+1][k]*t));});
@@ -180,15 +194,20 @@ function clear(){trace=null;maximum=null;waterHist=[];if(!keepView)view={a:0,b:1
 function resize(){const d=Math.min(devicePixelRatio||1,2);spec.width=Math.round(spec.clientWidth*d);spec.height=Math.round(spec.clientHeight*d);water.width=Math.round(water.clientWidth);water.height=Math.round(water.clientHeight);const wm=$('waterfallMarkers');if(wm){wm.width=water.width;wm.height=water.height;wm.style.top=water.offsetTop+'px';wm.style.left=water.offsetLeft+'px';wm.style.width=water.clientWidth+'px';wm.style.height=water.clientHeight+'px';}wc.fillStyle='#11191e';wc.fillRect(0,0,water.width,water.height);redrawWater();draw();labels();}
 function fmtHz(hz){const a=Math.abs(hz);return a>=1e9?(hz/1e9).toFixed(6)+' GHz':a>=1e6?(hz/1e6).toFixed(3)+' MHz':a>=1e3?(hz/1e3).toFixed(1)+' kHz':hz.toFixed(0)+' Hz';}
 function measBar(c){
- const k=freqFactor(),spec=connected&&spectrumMode,n=spec?specConfig().fft:c.fft,center=c.frequency*1e6*k,span=c.rate*k;
+ const k=freqFactor(),specM=connected&&isSpec(),cspecM=connected&&isCspec(),sweepM=connected&&isSweep();
+ const n=specM?specConfig().fft:cspecM?Number($('cspecFft').value):(latest?.fft)||c.fft;
+ const center=c.frequency*1e6*k,span=c.rate*k;
  // Hann window: 3 dB bandwidth 1.44 bins
  const rbw=1.44*c.rate/n,top=Number($('floor').value)+Number($('range').value),div=Number($('range').value)/4;
- const det=spec?($('specDetector').value==='max'?'max-hold':'average'):'average';
- const acq=spec?(specLast?`${(specLast.pairs/c.rate*1e3).toFixed(2)} ms · ${specLast.ffts} FFT · ${radio.spectrumContinuous(Number($('rate').value),Number($('fft').value))?'continuous capture':'snapshot'}`:'—')
+ const det=specM?($('specDetector').value==='max'?'max-hold':'average'):cspecM?($('cspecDetector').value==='max'?'max-hold':'average'):'average';
+ const acq=specM?(specLast?`${(specLast.pairs/c.rate*1e3).toFixed(2)} ms · ${specLast.ffts} FFT · ${radio.spectrumContinuous(Number($('rate').value),Number($('fft').value))?'continuous capture':'snapshot'}`:'—')
+  :cspecM?'gap-free continuous'
+  :sweepM?(latest?.steps?`${latest.steps} steps · ${latest.sweepMs?latest.sweepMs.toFixed(0)+' ms':'—'}`:'—')
   :(latest?.samples?`${(latest.samples/c.rate*1e3).toFixed(3)} ms burst`:'—');
+ const modeLabel=specM?'SPEC on-chip':cspecM?'CSPEC continuous':sweepM?'Panorama sweep':'burst IQ';
  const item=(k,v)=>`<span>${k} <b style="color:#e8eef0;font-weight:600">${v}</b></span>`;
  $('meas').innerHTML=[item('Start',fmtHz(center-span/2)),item('Center',fmtHz(center)),item('Span',fmtHz(span)),item('Stop',fmtHz(center+span/2)),
-  item('RBW',fmtHz(rbw)),item('Bins',`${n}`),item('Ref',`${top} dBFS`),item('Div',`${div} dB`),item('Det',det),item('Acq',acq),item('Mode',spec?'SPEC on-chip':'burst IQ')].join('');
+  item('RBW',fmtHz(rbw)),item('Bins',`${n}`),item('Ref',`${top} dBFS`),item('Div',`${div} dB`),item('Det',det),item('Acq',acq),item('Mode',modeLabel)].join('');
 }
 function labels(f){tuningWarning();const c=f||config();drawAxis(c);measBar(c);}
 function draw(){const w=spec.width,h=spec.height,d=Math.min(devicePixelRatio||1,2),floor=Number($('floor').value),range=Number($('range').value);sc.fillStyle='#182126';sc.fillRect(0,0,w,h);sc.lineWidth=d;sc.font=`${14*d}px Carlito,sans-serif`;
@@ -206,7 +225,9 @@ async function loop(){
  try{
   while(connected&&!paused){
    try{
-    if(spectrumMode&&radio.hasSpec)await specLoop();
+    if(isSpec()&&radio.hasSpec)await specLoop();
+    else if(isCspec()&&radio.hasCspec)await cspecLoop();
+    else if(isSweep()&&radio.hasSweep)await sweepLoop();
     else{
     const f=await(await api('frame',config())).json();
     if(connected&&!paused&&!radio.changingBaud&&selectRxFrame(f))render(f);
@@ -249,7 +270,7 @@ $('dismissSerialWarning').onclick=()=>{
 function state(){
  firmwareWarning();
  updateGpioControls();
- if(!connected||!spectrumMode)$('chipStats').hidden=true;
+ if(!connected||!isSpec())$('chipStats').hidden=true;
  serialWarning();
  $('baudStatus').hidden=!connected||radio.transport!=='UART';
  $('baudStatus').textContent=radio.transport==='UART'?`${radio.baudRate/1000000} MBaud`:'';
@@ -260,20 +281,23 @@ function state(){
  tuningWarning();
  // Channel markers (.mk) are display-only and stay usable while disconnected.
  for(const control of document.querySelectorAll('aside input:not(.mk),aside select'))control.disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
- const specOk=connected&&radio.canStreamSpectrum;
- $('specControls').hidden=!specOk;$('specMode').disabled=!specOk||(!!radio.changingBaud||!!radio.changingGpio);
- $('iqMode').disabled=!connected||(!!radio.changingBaud||!!radio.changingGpio);
- if(!specOk)spectrumMode=false;
- $('iqMode').setAttribute('aria-pressed',String(!spectrumMode));$('specMode').setAttribute('aria-pressed',String(spectrumMode));
- $('iqControls').hidden=spectrumMode;$('specOptions').hidden=!spectrumMode;
- const options=$(spectrumMode?'specOptions':'iqControls');
- if($('fftControl').parentElement!==options)options.prepend($('fftControl'));
- $('specRow').disabled=!specOk||!spectrumMode||(!!radio.changingBaud||!!radio.changingGpio);$('specDetector').disabled=$('specRow').disabled;
- if(connected&&spectrumMode)$('bits').disabled=true;
- {const specOn=connected&&spectrumMode;
+ const busy=(!!radio.changingBaud||!!radio.changingGpio);
+ // Capture-mode availability + the mode bar (lives in the spectrum chart, outside the aside).
+ const canSpec=connected&&radio.canStreamSpectrum,canCspec=connected&&radio.hasCspec,canSweep=connected&&radio.hasSweep;
+ if((isSpec()&&!canSpec)||(isCspec()&&!canCspec)||(isSweep()&&!canSweep))captureMode='iq';
+ $('modeSpec').hidden=!canSpec;$('modeCspec').hidden=!canCspec;$('modeSweep').hidden=!canSweep;
+ for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep']]){$(id).setAttribute('aria-pressed',String(captureMode===m));$(id).disabled=!connected||busy;}
+ $('iqControls').hidden=captureMode!=='iq';$('specOptions').hidden=!isSpec();$('sweepOptions').hidden=!isSweep();$('cspecOptions').hidden=!isCspec();
+ // #fftControl is shared by iq and spec; park it in whichever of the two panels is showing.
+ if(captureMode==='iq'||isSpec()){const options=$(isSpec()?'specOptions':'iqControls');if($('fftControl').parentElement!==options)options.prepend($('fftControl'));}
+ $('specRow').disabled=!canSpec||!isSpec()||busy;$('specDetector').disabled=$('specRow').disabled;
+ if(connected&&isSpec())$('bits').disabled=true;
+ $('fft8192').hidden=$('fft16384').hidden=!radio.hasBigcap; // BIGCAP long snapshots, IQ mode
+ {const specOn=connected&&isSpec();
   for(const o of $('rate').options){o.disabled=specOn&&!radio.spectrumProfiles(Number(o.value)).length;o.hidden=o.disabled;}
   if(specOn&&!radio.spectrumProfiles(Number($('rate').value)).length)$('rate').value=String(radio.specCapabilities.profiles[0][0]);
-  const sizes=specOn?specSizes(Number($('rate').value)):[512,1024,2048,4096];
+  const iqSizes=radio.hasBigcap?[512,1024,2048,4096,8192,16384]:[512,1024,2048,4096];
+  const sizes=specOn?specSizes(Number($('rate').value)):iqSizes;
   for(const o of $('fft').options){o.disabled=!sizes.includes(Number(o.value));o.hidden=o.disabled;}
   $('specNote').hidden=!specOn;
   $('specNote').textContent=radio.spectrumContinuous(Number($('rate').value),Number($('fft').value))
@@ -469,7 +493,7 @@ async function openFirmwareInstaller(event){
  }catch(e){installer?.close();firmwareHandoff=false;error(e);}
  finally{connectionBusy=false;state();}
 }
-$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){await disconnectRadio();currentBoardKey=null;const pb=$('profileBox');if(pb)pb.hidden=true;}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();spectrumMode=radio.canStreamSpectrum;applyRadioProfile();loadProfile();paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
+$('connect').onclick=async(ev)=>{closeConnectMenu();if(connectionBusy||radio.changingBaud||radio.changingGpio||(ev?.auto&&(connected||firmwareHandoff)))return;if(!ev?.auto)firmwareHandoff=false;connectionBusy=true;state();try{if(connected){await disconnectRadio();currentBoardKey=null;const pb=$('profileBox');if(pb)pb.hidden=true;}else{const port=await choosePort(ev);if(!port)return;await api('connect',{port});rememberPort(port);connected=true;checkFirmwareUpdate();captureMode=radio.canStreamSpectrum?'spec':'iq';applyRadioProfile();loadProfile();refreshDiag(true);paused=false;previous=0;latest=null;clear();loop();}error('');}catch(e){error(e,!['NotFoundError','AbortError'].includes(e?.name));}finally{connectionBusy=false;state();}};
 $('pause').onclick=()=>{paused=!paused;previous=0;state();if(!paused){error('');loop();}};$('clear').onclick=clear;
 for(const id of ['rate','bits','fft'])$(id).onchange=()=>{state();labels();};
 $('frequency').onchange=()=>{tuneFrequency=Number($('frequency').value);labels();};
@@ -505,7 +529,9 @@ function boardKey(){const sn=radio.port&&radio.port.device&&radio.port.device.se
 function readProfiles(){try{const v=JSON.parse(localStorage.getItem('espSdrProfiles')||'{}');return v&&typeof v==='object'?v:{};}catch(e){return {};}}
 function collectProfile(){return {freqCal,markers:{...markerPrefs},
  display:{floor:$('floor').value,range:$('range').value,average:$('average').value,hold:$('hold').checked,autoscale:$('autoscale').checked},
- capture:{mode:spectrumMode,specRow:$('specRow').value,specDetector:$('specDetector').value},
+ capture:{mode:captureMode,specRow:$('specRow').value,specDetector:$('specDetector').value,
+  cspecFft:$('cspecFft').value,cspecDetector:$('cspecDetector').value,cspecNavg:$('cspecNavg').value,
+  sweepF0:$('sweepF0').value,sweepF1:$('sweepF1').value,sweepStep:$('sweepStep').value,sweepFft:$('sweepFft').value,sweepNavg:$('sweepNavg').value},
  radio:{frequency:tuneFrequency,rate:$('rate').value,fft:$('fft').value,bits:$('bits').value,gainMode,gain:$('gain').value,bandwidth:analogBandwidth}};}
 function saveProfile(){if(!currentBoardKey)return;const all=readProfiles();all[currentBoardKey]=collectProfile();try{localStorage.setItem('espSdrProfiles',JSON.stringify(all));}catch(e){}}
 function markDirty(){if(loadingProfile||!connected||!currentBoardKey)return;clearTimeout(saveTimer);saveTimer=setTimeout(saveProfile,500);}
@@ -527,14 +553,20 @@ function loadProfile(){
   if(typeof d.hold==='boolean')$('hold').checked=d.hold;
   if(typeof d.autoscale==='boolean')$('autoscale').checked=d.autoscale;
   const cap=p.capture||{};
-  if(typeof cap.mode==='boolean')spectrumMode=cap.mode&&radio.canStreamSpectrum;
+  const modeOk=m=>m==='iq'||(m==='spec'&&radio.canStreamSpectrum)||(m==='cspec'&&radio.hasCspec)||(m==='sweep'&&radio.hasSweep);
+  if(typeof cap.mode==='string'&&modeOk(cap.mode))captureMode=cap.mode;
+  else if(typeof cap.mode==='boolean')captureMode=cap.mode&&radio.canStreamSpectrum?'spec':'iq';
+  const setSel=(id,v)=>{if(v!==undefined&&[...$(id).options].some(o=>o.value===String(v)))$(id).value=String(v);};
+  setSel('cspecFft',cap.cspecFft);setSel('cspecDetector',cap.cspecDetector);setSel('cspecNavg',cap.cspecNavg);
+  setSel('sweepFft',cap.sweepFft);setSel('sweepNavg',cap.sweepNavg);
+  for(const [id,v] of [['sweepF0',cap.sweepF0],['sweepF1',cap.sweepF1],['sweepStep',cap.sweepStep]])if(Number.isFinite(Number(v))&&v!=='')$(id).value=String(Number(v));
   if(cap.specRow!==undefined&&[...$('specRow').options].some(o=>o.value===String(cap.specRow)))$('specRow').value=String(cap.specRow);
   if(cap.specDetector!==undefined&&[...$('specDetector').options].some(o=>o.value===String(cap.specDetector)))$('specDetector').value=String(cap.specDetector);
   const r=p.radio||{};
   if(Number.isInteger(r.frequency)&&radio.validFrequency(r.frequency)){tuneFrequency=r.frequency;$('frequency').value=r.frequency;}
   if(r.rate!==undefined&&radio.rxRates.includes(Number(r.rate)))$('rate').value=String(Number(r.rate));
   if(r.bits!==undefined&&radio.sampleBits.includes(Number(r.bits)))$('bits').value=String(Number(r.bits));
-  if(r.fft!==undefined&&[256,512,1024,2048,4096].includes(Number(r.fft)))$('fft').value=String(Number(r.fft));
+  if(r.fft!==undefined&&[256,512,1024,2048,4096,8192,16384].includes(Number(r.fft))&&(Number(r.fft)<=4096||radio.hasBigcap))$('fft').value=String(Number(r.fft));
   if(r.gainMode==='MANUAL'||(r.gainMode==='HARDWARE'&&radio.hasHardwareAgc))gainMode=r.gainMode;
   if(r.gain!==undefined&&Number(r.gain)>=radio.gainMin&&Number(r.gain)<=radio.gainMax){$('gain').value=r.gain;$('gainValue').textContent=`${$('gain').value} / ${radio.gainMax}`;}
   const b=radio.bandwidthRange;
@@ -579,6 +611,7 @@ function selectRxFrame(f){
 
 // Firmware-computed spectrum stream.
 let specPending=[],specLast=null,specRAF=0,specCount=[],specInfo=null,autoT=0,waterMap=null,lut32=null;
+let cspecPending=[],cspecRAF=0,cspecCount=[];
 // Firmware bins are |FFT(I+jQ)|^2 in FFT order; this app displays conj(I+jQ)
 // (see capture(): q is negated), so web bin j holds firmware bin (n/2-j) mod n.
 // code/step = 10log10|X|^2 with X = FFT(IQ10*64*hann)/n; 84.3 dB maps that to
@@ -617,14 +650,14 @@ async function specLoop(){
   // hidden tab: no animation frames, so bound the backlog here
   if(specPending.length>1024)specPending.splice(0,specPending.length-512);
   if(specCount.length>4096){const t=performance.now()-1000;let i=0;while(i<specCount.length&&specCount[i]<t)i++;specCount.splice(0,i);}
- },()=>!connected||paused||!spectrumMode||changed());
- if(!changed()&&spectrumMode){queueRow();if(specPending.length&&!specRAF)specRAF=requestAnimationFrame(specFrame);}
+ },()=>!connected||paused||!isSpec()||changed());
+ if(!changed()&&isSpec()){queueRow();if(specPending.length&&!specRAF)specRAF=requestAnimationFrame(specFrame);}
 }
-function specFrame(){specRAF=0;if(specPending.length){const rows=specPending;specPending=[];renderSpec(rows);}if(connected&&!paused&&spectrumMode)specRAF=requestAnimationFrame(specFrame);}
+function specFrame(){specRAF=0;if(specPending.length){const rows=specPending;specPending=[];renderSpec(rows);}if(connected&&!paused&&isSpec())specRAF=requestAnimationFrame(specFrame);}
 function renderSpec(rows){
  const c=specConfig(),k=specDisplayKey(c);
  rows=rows.filter(row=>row.key===k);
- if(!spectrumMode||!rows.length)return;
+ if(!isSpec()||!rows.length)return;
  const nb=rows[0].bins.length;
  if(key!==k){key=k;clear();}
  const batch=new SpectrumAccumulator(nb,c.maxHold);
@@ -653,8 +686,110 @@ function renderSpec(rows){
  const g=specInfo?.gain;$('gainStatus').textContent=(g?.mode==='HARDWARE'?'Hardware AGC':g?`Manual · index ${g.index}`:'');
  $('crc').textContent=`SPEC · ${radio.spectrumContinuous(Number($('rate').value),Number($('fft').value))?'continuous capture':'snapshots with gaps'} · #${specLast?.frame??0}${specLast?.drops?` · ${specLast.drops} dropped`:''}${specInfo?.crcErrors?` · ${specInfo.crcErrors} CRC err`:''}${specInfo?.hostDropped?` · ${Math.round(specInfo.hostDropped/1024)} kB skipped (page busy)`:''}`;
 }
-$('iqMode').onclick=()=>{spectrumMode=false;state();labels();};
-$('specMode').onclick=()=>{if(!radio.canStreamSpectrum)return;spectrumMode=true;state();labels();};
+// ---- ESPsoup continuous waterfall (CSPEC) ----------------------------------
+// Each SPL line (u8, host order -fs/2..+fs/2, DC centred) becomes a waterfall row.
+function cspecConfig(){
+ const nfft=Number($('cspecFft').value),navg=Number($('cspecNavg').value)||8,stride=1;
+ if(!(nfft>=16&&nfft<=256)||nfft*navg*stride>8192)return null;
+ return {frequency:loFrequency(),rate:Number($('rate').value),bandwidth:analogBandwidth,nfft,navg,stride,
+  mode:$('cspecDetector').value==='mean'?0:1,gainMode,gain:Number($('gain').value)};
+}
+async function cspecLoop(){
+ const c=cspecConfig();
+ if(!c){await new Promise(r=>setTimeout(r,200));return;}
+ const changed=()=>{const m=cspecConfig();return !m||m.frequency!==c.frequency||m.rate!==c.rate||m.nfft!==c.nfft||m.navg!==c.navg||m.mode!==c.mode||m.gainMode!==c.gainMode||m.gain!==c.gain;};
+ if(!cspecRAF)cspecRAF=requestAnimationFrame(cspecFrame);
+ await radio.cspec(c,(line,meta)=>{
+  if(changed())return;
+  const nfft=meta.nfft,sh=meta.sh,disp=new Float32Array(nfft);
+  // u8 = 2*10*log10(|X|^2)+12*sh -> approx dBFS (arbitrary reference, display-only)
+  for(let j=0;j<nfft;j++)disp[j]=(line[j]-12*sh)/2-128;
+  cspecPending.push(disp);
+  if(cspecPending.length>2048)cspecPending.splice(0,cspecPending.length-512);
+ },()=>!connected||paused||!isCspec()||changed());
+}
+function cspecFrame(){cspecRAF=0;if(cspecPending.length){const rows=cspecPending;cspecPending=[];renderCspec(rows);}if(connected&&!paused&&isCspec())cspecRAF=requestAnimationFrame(cspecFrame);}
+function renderCspec(rows){
+ if(!isCspec()||!rows.length)return;
+ const c=cspecConfig();if(!c)return;
+ const nfft=rows[0].length,k=['cspec',c.frequency,c.rate,nfft,c.mode].join('/');
+ if(key!==k){key=k;clear();}
+ const a=Number($('average').value),cur=rows[rows.length-1];
+ if(trace&&trace.length!==nfft){trace=null;maximum=null;}
+ trace=Array.from(cur,(v,i)=>trace?10*Math.log10(a*10**(trace[i]/10)+(1-a)*10**(v/10)):v);
+ if(!maximum||maximum.length!==nfft)maximum=Array(nfft).fill(-Infinity);
+ for(const r of rows)for(let i=0;i<nfft;i++)if(r[i]>maximum[i])maximum[i]=r[i];
+ latest={frequency:c.frequency,rate:c.rate,fft:nfft,spectrum:trace};draw();
+ const n=Math.min(rows.length,water.height);
+ wc.drawImage(water,0,0,water.width,water.height-n,0,n,water.width,water.height-n);
+ const newest=[];for(let r=0;r<n;r++)newest.push(rows[rows.length-1-r]);pushWater(newest);paintRows(newest,0);
+ autoScale(trace);
+ $('empty').hidden=true;labels(latest);
+ cspecCount.push(performance.now());const now=performance.now();while(cspecCount.length&&cspecCount[0]<now-1000)cspecCount.shift();
+ $('fps').textContent=`${cspecCount.length}`;$('fpsLabel').textContent='lines/s';
+ $('throughput').textContent=(cspecCount.length*nfft/1e3).toFixed(0);$('throughputLabel').textContent=`kB/s over ${radio.transport} · ${c.rate/1e6} MS/s`;
+ $('latency').textContent='0';$('latencyLabel').textContent=`gap-free · nfft ${nfft}`;
+ let peak=0;for(let j=1;j<nfft;j++)if(cur[j]>cur[peak])peak=j;const pk=c.frequency*1e6+(peak-nfft/2)*c.rate/nfft;peakHzNominal=pk;$('peak').textContent=(pk*freqFactor()/1e6).toFixed(4);
+ $('crc').textContent=`CSPEC · continuous · ${radio.spectrumCrcErrors?radio.spectrumCrcErrors+' CRC err':'OK'}`;
+}
+// ---- ESPsoup wideband panorama (SWEEP) -------------------------------------
+// One pass f0..f1 per call; the outer loop re-issues it, one waterfall row per pass.
+const SWEEP_OFFSET=40; // shift the arbitrary-reference dB into the dBFS display window
+function sweepConfig(){
+ const f0=Number($('sweepF0').value),f1=Number($('sweepF1').value),step=Number($('sweepStep').value),nfft=Number($('sweepFft').value),navg=Number($('sweepNavg').value)||8,rate=Number($('rate').value);
+ if(!Number.isInteger(f0)||!Number.isInteger(f1)||!Number.isInteger(step)||f1<=f0||f1>6000||f0<50||step<1||(f1-f0)/step>2000||nfft*navg>16380)return null;
+ return {rate,f0,f1,step,nfft,navg,gainMode,gain:Number($('gain').value)};
+}
+async function sweepLoop(){
+ const c=sweepConfig();
+ if(!c){await new Promise(r=>setTimeout(r,200));return;}
+ const binHz=c.rate/c.nfft,spanHz=(c.f1-c.f0)*1e6,P=Math.max(32,Math.min(8192,Math.round(spanHz/binHz))),pano=new Float32Array(P).fill(-Infinity),base=c.f0*1e6,half=c.nfft/2;
+ const changed=()=>{const m=sweepConfig();return !m||m.f0!==c.f0||m.f1!==c.f1||m.step!==c.step||m.rate!==c.rate||m.nfft!==c.nfft||m.navg!==c.navg||m.gainMode!==c.gainMode||m.gain!==c.gain;};
+ const t0=performance.now();let steps=0,lastPaint=0;
+ await radio.sweep(c,(meta,bins)=>{
+  if(changed())return;steps++;
+  // Map each step bin to the panorama by its fraction of the whole span (P may be
+  // clamped below the natural bin count on a wide sweep; overlaps max-combine).
+  for(let j=0;j<c.nfft;j++){const idx=Math.round((meta.mhz*1e6+(j-half)*binHz-base)/spanHz*P);if(idx<0||idx>=P)continue;const v=bins[j]-SWEEP_OFFSET;if(v>pano[idx])pano[idx]=v;}
+  const now=performance.now();if(now-lastPaint>100){lastPaint=now;renderSweep(pano,c,P,false,steps,now-t0);}
+ },()=>!connected||paused||!isSweep()||changed());
+ if(!changed()&&isSweep())renderSweep(pano,c,P,true,steps,performance.now()-t0);
+}
+function renderSweep(pano,c,P,pushRow,steps,ms){
+ const center=(c.f0+c.f1)/2,rate=(c.f1-c.f0)*1e6,k=['sweep',c.f0,c.f1,c.step,c.rate,c.nfft].join('/');
+ if(key!==k){key=k;clear();}
+ let mn=Infinity;for(let i=0;i<P;i++){const v=pano[i];if(v>-Infinity&&v<mn)mn=v;}if(mn===Infinity)mn=-120;
+ const disp=new Array(P);for(let i=0;i<P;i++)disp[i]=pano[i]>-Infinity?pano[i]:mn;
+ trace=disp;maximum=null;
+ latest={frequency:center,rate,fft:P,spectrum:disp,steps,sweepMs:ms};draw();
+ if(pushRow){wc.drawImage(water,0,0,water.width,water.height-1,0,1,water.width,water.height-1);pushWater([Float32Array.from(disp)]);paintRows([waterHist[0]],0);}
+ autoScale(disp);
+ $('empty').hidden=true;labels(latest);
+ $('fps').textContent=ms?(1000/ms).toFixed(2):'—';$('fpsLabel').textContent='sweeps/s';
+ $('throughput').textContent=`${steps}`;$('throughputLabel').textContent=`steps · ${c.rate/1e6} MS/s · ${c.nfft} bins`;
+ $('latency').textContent=ms?ms.toFixed(0):'—';$('latencyLabel').textContent='ms / sweep';
+ let peak=0;for(let j=1;j<P;j++)if(disp[j]>disp[peak])peak=j;const pk=c.f0*1e6+peak*(rate/P);peakHzNominal=pk;$('peak').textContent=(pk*freqFactor()/1e6).toFixed(3);
+ $('crc').textContent=`SWEEP · ${c.f0}–${c.f1} MHz · ${radio.spectrumCrcErrors?radio.spectrumCrcErrors+' CRC err':'OK'}`;
+}
+// ---- ESPsoup device diagnostics into the debug panel -----------------------
+async function refreshDiag(force){
+ if(!connected||!radio.hasFwopt)return;
+ // Any control line stops a running SPEC/CSPEC/SWEEP, so only query when idle.
+ if(!force&&captureMode!=='iq'&&!paused)return;
+ try{const d=await radio.diagnostics();if(d){deviceDiag=d;dbg.stat();}}catch(e){}
+}
+setInterval(()=>refreshDiag(false),3000);
+for(const id of ['cspecFft','cspecDetector','cspecNavg','sweepFft','sweepNavg','sweepF0','sweepF1','sweepStep'])$(id).onchange=()=>labels();
+function setCaptureMode(m){
+ if(m===captureMode)return;
+ if(m==='spec'&&!radio.canStreamSpectrum)return;
+ if(m==='cspec'&&!radio.hasCspec)return;
+ if(m==='sweep'&&!radio.hasSweep)return;
+ captureMode=m;
+ // The mode bar sits outside the aside, so its change is not auto-saved by the aside listener.
+ markDirty();state();labels();clear();
+}
+for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep']])$(id).onclick=()=>setCaptureMode(m);
 // Auto scale: floor a little under the noise (20th percentile), top a little
 // above the strongest bin; applied at most twice a second, smoothed, without
 // clearing the waterfall.

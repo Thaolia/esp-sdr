@@ -102,6 +102,37 @@ Sur mobile (largeur ≤ 850 px), le panneau de contrôles s'empile sous l'en-tê
 comme auparavant ; les chevrons, le bouton debug, la poignée de redimensionnement
 et le panneau de debug ne sont pas affichés.
 
+## Firmware ESPsoup (ESP32-C5)
+
+Le visualiseur est compatible avec le firmware
+[ESPsoup pour l'ESP32-C5](https://github.com/pit711/espsoup-firmware), un fork **additif**
+de l'ESP-SDR d'ESPARGOS : une carte sous ESPsoup se présente comme un récepteur C5
+ordinaire, et le spectre partagé tourne sur son moteur rapide (captures et waterfall plus
+rapides, sans aucun réglage). Quand la carte annonce les capacités correspondantes, le
+visualiseur expose en plus :
+
+- **Barre de modes au-dessus du spectre** — bascule entre les modes disponibles :
+  **I/Q** (captures burst), **Spectre** (FFT on-chip partagée), **Panorama** et
+  **Waterfall continu**. Chaque bouton n'apparaît que si le firmware le supporte.
+- **Panorama (SWEEP)** — balaye toute la plage que vous définissez (Départ / Arrivée /
+  Pas, en MHz) et assemble un spectre large bande en plaçant chaque pas à sa fréquence
+  centrale ; l'axe des fréquences couvre toute la plage et chaque balayage complet ajoute
+  une ligne au waterfall.
+- **Waterfall continu (CSPEC)** — waterfall gap-free haute cadence issu du moteur continu
+  on-device (USB natif), avec résolution FFT (16–256) et détecteur (max / moyenne) réglables.
+- **Tuning fin (FREQK)** — quand le firmware l'annonce, le champ de fréquence accepte le
+  pas de **1 kHz** (ex. `2437.5`), pas seulement le MHz entier.
+- **Snapshots longs (BIGCAP)** — en mode I/Q, des tailles de FFT 8192 / 16384 deviennent
+  disponibles (jusqu'à 32704 échantillons par capture) pour une trace plus fine / plus de
+  moyennage.
+- **Diagnostics ESPsoup** dans le panneau de debug — version firmware (`FWOPT`), température
+  de la puce (`TEMP`), tas libre / plus gros bloc (`HEAP`), chemin de tuning (`TUNEM`) et
+  moteur de capture (`ENGINE`), rafraîchis uniquement hors streaming (une ligne de commande
+  arrêterait un flux SPEC / CSPEC / SWEEP).
+
+Avec un autre firmware (ESP-SDR standard, autres puces), ces modes et réglages restent
+simplement masqués — le visualiseur se comporte comme avant.
+
 ## Configuration sur ordinateur
 
 Utilisez Chrome, Edge ou [Firefox 151 ou ultérieur](https://hacks.mozilla.org/2026/05/web-serial-support-in-firefox/)

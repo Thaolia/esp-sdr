@@ -59,6 +59,34 @@ hold BOOT, tap RESET, then release BOOT and reconnect in the installer.
 
 See the [ESP-SDR guide](https://espargos.net/espsdr/) for supported chips and setup.
 
+## ESPsoup firmware (ESP32-C5)
+
+The viewer is compatible with the [ESPsoup firmware for the ESP32-C5](https://github.com/pit711/espsoup-firmware),
+an **additive** fork of ESPARGOS' ESP-SDR: a board running ESPsoup appears as an ordinary
+C5 receiver, and the shared spectrum runs on its fast engine (faster captures and
+waterfall, with no setup). When the board advertises the matching capabilities, the viewer
+also exposes:
+
+- **A mode bar above the spectrum** — switch between the available modes: **I/Q** (burst
+  captures), **Spectrum** (shared on-chip FFT), **Panorama** and **Live waterfall**. Each
+  button only appears when the firmware supports it.
+- **Panorama (SWEEP)** — sweeps the whole range you set (Start / Stop / Step, in MHz) and
+  assembles a wideband spectrum by placing each step at its centre frequency; the frequency
+  axis spans the whole range and each completed sweep adds a waterfall row.
+- **Live waterfall (CSPEC)** — a gap-free, high-rate waterfall from the on-device continuous
+  engine (native USB), with adjustable FFT size (16–256) and detector (max / average).
+- **Fine tuning (FREQK)** — when advertised, the frequency field accepts a **1 kHz** step
+  (e.g. `2437.5`), not just whole MHz.
+- **Long snapshots (BIGCAP)** — in I/Q mode, FFT sizes of 8192 / 16384 become available (up
+  to 32704 samples per capture) for a finer trace / more averaging.
+- **ESPsoup diagnostics** in the debug panel — firmware version (`FWOPT`), chip temperature
+  (`TEMP`), free heap / largest block (`HEAP`), tuning path (`TUNEM`) and capture engine
+  (`ENGINE`), refreshed only while not streaming (any command line would stop a running
+  SPEC / CSPEC / SWEEP).
+
+With other firmware (stock ESP-SDR, other chips) these modes and controls stay hidden and
+the viewer behaves as before.
+
 ## Desktop setup
 
 Use Chrome, Edge, or [Firefox 151 or later](https://hacks.mozilla.org/2026/05/web-serial-support-in-firefox/)
