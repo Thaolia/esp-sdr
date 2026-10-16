@@ -293,8 +293,10 @@ function state(){
  $('modeSpec').hidden=!canSpec;$('modeCspec').hidden=!canCspec;$('modeSweep').hidden=!canSweep;$('modeBle').hidden=!canBle;
  for(const [id,m] of [['modeIq','iq'],['modeSpec','spec'],['modeCspec','cspec'],['modeSweep','sweep'],['modeBle','ble']]){$(id).setAttribute('aria-pressed',String(captureMode===m));$(id).disabled=!connected||busy;}
  $('iqControls').hidden=captureMode!=='iq';$('specOptions').hidden=!isSpec();$('sweepOptions').hidden=!isSweep();$('cspecOptions').hidden=!isCspec();$('bleOptions').hidden=!isBle();
- // BLE scan replaces the spectrum/waterfall charts with the device table.
- {const ble=isBle(),sc=$('spectrum').closest('.chart'),wc2=$('waterfall').closest('.chart');if(sc)sc.hidden=ble;if(wc2)wc2.hidden=ble;$('splitter').hidden=ble;$('blePanel').hidden=!ble||!connected;}
+ // BLE scan replaces the spectrum/waterfall charts with the device table, but the mode bar lives in
+ // the spectrum chart head: collapse that chart to its head (keep the bar clickable) instead of
+ // hiding it, otherwise there is no way back to another mode.
+ {const ble=isBle(),sc=$('spectrum').closest('.chart'),wc2=$('waterfall').closest('.chart');if(sc)sc.classList.toggle('headonly',ble);if(wc2)wc2.hidden=ble;$('splitter').hidden=ble;$('blePanel').hidden=!ble||!connected;}
  // #fftControl is shared by iq and spec; park it in whichever of the two panels is showing.
  if(captureMode==='iq'||isSpec()){const options=$(isSpec()?'specOptions':'iqControls');if($('fftControl').parentElement!==options)options.prepend($('fftControl'));}
  $('specRow').disabled=!canSpec||!isSpec()||busy;$('specDetector').disabled=$('specRow').disabled;
