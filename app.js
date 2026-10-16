@@ -875,6 +875,16 @@ function bleConfig(){
  return {channel,frequency:bleChannelFreq(channel),source:$('bleSource').value,rateIdx:4,R:2,len:48,gainMode:'MANUAL',gain};
 }
 function bleEscape(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// Advertiser address types (the "Type" column): a short gloss for the always-visible legend and a
+// fuller sentence for the per-cell tooltip, single-sourced so the two never drift.
+const BLE_ADDR_TYPES={
+ public:{gloss:'stable, maker-assigned',title:'Public: globally unique, IEEE-assigned (maker OUI). A stable identifier.'},
+ 'random-static':{gloss:'fixed until reboot',title:'Static random: randomly generated, stays fixed until the device power-cycles.'},
+ rpa:{gloss:'private, rotates (resolvable)',title:'Resolvable private: rotates periodically for privacy; a bonded peer can resolve it to the real identity.'},
+ nrpa:{gloss:'private, rotates',title:'Non-resolvable private: random and rotating, cannot be tied back to the device.'},
+ random:{gloss:'',title:'Random address (subtype not identified).'}
+};
+$('bleLegend').innerHTML='Address type — '+Object.entries(BLE_ADDR_TYPES).filter(([,v])=>v.gloss).map(([k,v])=>`<b>${k}</b>: ${v.gloss}`).join(' · ')+' · <a href="https://novelbits.io/how-to-protect-the-privacy-of-your-bluetooth-low-energy-device/" target="_blank" rel="noopener noreferrer">details &#8599;</a>';
 function upsertBle(p,rssi,src){
  if(!p||!p.address||!p.crcOk)return;
  const d=bleDevices.get(p.address)||{name:'',count:0};
@@ -888,7 +898,7 @@ function renderBleTable(){
  const now=performance.now(),body=$('bleBody');body.textContent='';
  for(const d of [...bleDevices.entries()].sort((a,b)=>b[1].rssi-a[1].rssi)){
   const [addr,v]=d,age=(now-v.last)/1000,tr=document.createElement('tr');
-  tr.innerHTML=`<td>${addr}</td><td class="ble-type">${v.type||''}</td><td>${v.name?bleEscape(v.name):''}</td><td class="num">${v.rssi.toFixed(1)}</td><td class="num">${age<1.5?'now':age<120?age.toFixed(0)+'s':Math.round(age/60)+'m'}</td><td class="num">${v.count}</td>`;
+  tr.innerHTML=`<td>${addr}</td><td class="ble-type" title="${BLE_ADDR_TYPES[v.type]?.title||''}">${v.type||''}</td><td>${v.name?bleEscape(v.name):''}</td><td class="num">${v.rssi.toFixed(1)}</td><td class="num">${age<1.5?'now':age<120?age.toFixed(0)+'s':Math.round(age/60)+'m'}</td><td class="num">${v.count}</td>`;
   body.append(tr);
  }
  $('bleEmpty').hidden=bleDevices.size>0;
