@@ -32,7 +32,7 @@ let firmwareCheck=0,firmwareUpdate=null;
 let freqCal=0;
 try{const v=Number(localStorage.getItem('espSdrFreqCal'));if(Number.isFinite(v)&&Math.abs(v)<=500)freqCal=v;}catch(e){}
 const freqFactor=()=>1+freqCal/1e6;
-let peakHzNominal=null,calObservedHz=null,calPicking=false;
+let peakHzNominal=null,calObservedHz=null,calPicking=false,calTargetHz=null,calTimer=null,calBuf=[];
 // Per-board configuration profiles, keyed by USB serial (native/WebUSB) or model.
 let currentBoardKey=null,loadingProfile=false,saveTimer=0;
 let connected=false,paused=false,latest=null,trace=null,maximum=null,previous=0,key='',running=false,tuneFrequency=2412,analogBandwidth=20;
@@ -523,14 +523,53 @@ for(const key of ['wifi24','wifi5','ble','bt','waterfall']){const el=$('mark'+ke
 function fmtPpm(){if(!freqCal)return 'Calibration off';const hz=2440e6*freqCal/1e6;return `${freqCal>0?'+':''}${freqCal.toFixed(1)} ppm (${hz>=0?'+':'−'}${Math.abs(hz/1e3).toFixed(1)} kHz @ 2.44 GHz)`;}
 function applyCal(ppm){freqCal=Math.max(-500,Math.min(500,Number(ppm)||0));try{localStorage.setItem('espSdrFreqCal',String(freqCal));}catch(e){}$('calPpm').value=freqCal;$('calStatus').textContent=fmtPpm();draw();labels();}
 function calPickOff(){calPicking=false;$('calPick').setAttribute('aria-pressed','false');$('calPick').textContent='Pick on graph';}
-// Observed frequency must be the uncalibrated (nominal) value to yield absolute ppm.
-function calGrab(hz){calObservedHz=hz;$('calObserved').textContent=(hz/1e6).toFixed(4)+' MHz';$('calForm').hidden=false;if(!$('calTrue').value)$('calTrue').value=(hz*freqFactor()/1e6).toFixed(3);}
+// Refine a nominal frequency to the sub-bin peak: snap to the local spectrum max near it, then
+// quadratic-interpolate the three bins around it (a log-magnitude parabola). This gives a frequency
+// far finer than one FFT bin, which is what bounds the achievable calibration precision.
+function refinePeakHz(nearHz){
+ const s=latest&&latest.spectrum;if(!s||!s.length||!Number.isFinite(latest.rate)||!Number.isFinite(nearHz))return nearHz;
+ const N=s.length,center=latest.frequency*1e6,binHz=latest.rate/N,win=Math.max(2,Math.round(N*0.01));
+ // In zero-IF 'raw' mode the LO-leakage spike sits at the center bins; keep the snap off them so a
+ // weak reference nearby is not mistaken for DC (offset-LO mode moves the signal away entirely).
+ const dc=$('dcMode')&&$('dcMode').value==='raw'?2:-1,atDc=i=>Math.abs(i-N/2)<=dc;
+ let bm=Math.max(1,Math.min(N-2,Math.round((nearHz-center)/binHz+N/2)));
+ for(let i=Math.max(1,bm-win);i<=Math.min(N-2,bm+win);i++)if(!atDc(i)&&(atDc(bm)||s[i]>s[bm]))bm=i;
+ if(atDc(bm))return nearHz; // only the DC region was in reach — do not lock onto leakage
+ const y0=s[bm-1],y1=s[bm],y2=s[bm+1],den=y0-2*y1+y2;
+ let d=den<0?0.5*(y0-y2)/den:0;if(!(d>-0.5&&d<0.5))d=0;
+ return center+(bm+d-N/2)*binHz;
+}
+// Observed frequency must stay the uncalibrated (nominal) value to yield absolute ppm. While the
+// form is open, average the refined peak over ~1.5 s and show its jitter so Apply uses a settled
+// reading. calTargetHz null = track the global peak; set = track the local peak near a picked spot.
+function calLiveTick(){
+ const base=calTargetHz!=null?calTargetHz:peakHzNominal;
+ if(!connected||base==null||!latest||!latest.spectrum)return;
+ const hz=refinePeakHz(base);if(!Number.isFinite(hz))return;
+ calBuf.push(hz);if(calBuf.length>12)calBuf.shift();
+ const mean=calBuf.reduce((a,b)=>a+b,0)/calBuf.length;
+ const sd=calBuf.length>1?Math.sqrt(calBuf.reduce((a,b)=>a+(b-mean)*(b-mean),0)/calBuf.length):0;
+ calObservedHz=mean;
+ $('calObserved').textContent=`${(mean/1e6).toFixed(5)} MHz · ±${sd<1000?sd.toFixed(0)+' Hz':(sd/1e3).toFixed(1)+' kHz'}`;
+ calPreview();
+}
+function calLiveStart(target){calTargetHz=target==null?null:target;calBuf=[];if(!calTimer)calTimer=setInterval(calLiveTick,120);calLiveTick();}
+function calLiveStop(){if(calTimer){clearInterval(calTimer);calTimer=null;}calTargetHz=null;}
+function calOpen(target){$('calForm').hidden=false;if(!$('calTrue').value){const h=refinePeakHz(target==null?peakHzNominal:target);if(Number.isFinite(h))$('calTrue').value=(h*freqFactor()/1e6).toFixed(4);}calLiveStart(target);}
+function calPreview(){
+ const el=$('calPreview');if(!el)return;const trueMHz=Number($('calTrue').value);
+ if(!Number.isFinite(trueMHz)||trueMHz<=0||!calObservedHz){el.textContent='';return;}
+ const refMHz=latest&&Number.isFinite(latest.frequency)?latest.frequency:trueMHz,ppm=(trueMHz*1e6/calObservedHz-1)*1e6,kHz=refMHz*ppm/1e3;
+ el.textContent=`→ ${ppm>=0?'+':''}${ppm.toFixed(2)} ppm (${kHz>=0?'+':'−'}${Math.abs(kHz).toFixed(1)} kHz at ${Math.round(refMHz)} MHz)`;
+}
 $('calPpm').value=freqCal;$('calStatus').textContent=fmtPpm();
 $('calPpm').onchange=()=>{const v=Number($('calPpm').value);if(Number.isFinite(v))applyCal(v);};
-$('calReset').onclick=()=>{$('calForm').hidden=true;calPickOff();applyCal(0);};
-$('calFromPeak').onclick=()=>{if(peakHzNominal==null){error('No peak yet — connect and wait for a live signal.');return;}calGrab(peakHzNominal);};
-$('calApply').onclick=()=>{const trueMHz=Number($('calTrue').value);if(!Number.isFinite(trueMHz)||trueMHz<=0||!calObservedHz){error('Enter the reference true frequency in MHz.');return;}applyCal((trueMHz*1e6/calObservedHz-1)*1e6);$('calForm').hidden=true;calPickOff();error('');};
+$('calTrue').oninput=calPreview;
+$('calReset').onclick=()=>{calLiveStop();$('calForm').hidden=true;calPickOff();applyCal(0);};
+$('calFromPeak').onclick=()=>{if(peakHzNominal==null){error('No peak yet — connect and wait for a live signal.');return;}calPickOff();calOpen(null);};
+$('calApply').onclick=()=>{const trueMHz=Number($('calTrue').value);if(!Number.isFinite(trueMHz)||trueMHz<=0||!calObservedHz){error('Enter the reference true frequency in MHz.');return;}applyCal((trueMHz*1e6/calObservedHz-1)*1e6);calLiveStop();$('calForm').hidden=true;calPickOff();error('');};
 $('calPick').onclick=()=>{calPicking=!calPicking;$('calPick').setAttribute('aria-pressed',String(calPicking));$('calPick').textContent=calPicking?'Click the peak on the graph…':'Pick on graph';};
+$('calControls').addEventListener('toggle',()=>{if(!$('calControls').open){calLiveStop();$('calForm').hidden=true;calPickOff();}});
 // ---- per-board configuration profiles --------------------------------------
 // Keyed by the native-USB serial number (the chip MAC, WebUSB only) when
 // available, otherwise by chip model. Settings auto-save (debounced) on any
@@ -607,7 +646,7 @@ $('profileForget').onclick=()=>{if(!currentBoardKey)return;const all=readProfile
  tgl.onclick=()=>setDebug(!main.classList.contains('debug-open'));
  $('debugClear').onclick=()=>dbg.clear();}
 spec.onmousemove=e=>{if(!latest)return;const x=viewFrac(e.clientX,spec),i=Math.max(0,Math.min(latest.fft-1,Math.floor(x*latest.fft)));$('cursor').textContent=`${((latest.frequency*1e6+(x-.5)*latest.rate)*freqFactor()/1e6).toFixed(5)} MHz · ${latest.spectrum[i].toFixed(1)} dBFS`;};
-function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: grab the observed (nominal) frequency instead of tuning */if(calPicking&&latest){calPickOff();calGrab(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
+function queueTune(e,el){if(suppressClick){suppressClick=false;return;}if(e.detail>1)return;/* calibration pick mode: track the refined peak near the click instead of tuning */if(calPicking&&latest){calPickOff();calOpen(latest.frequency*1e6+(viewFrac(e.clientX,el)-.5)*latest.rate);return;}clearTimeout(tuneClick);const x=e.clientX;tuneClick=setTimeout(()=>{if(connected&&latest){tuneFrequency=radio.nearestFrequency(latest.frequency+(viewFrac(x,el)-.5)*latest.rate/1e6);$('frequency').value=tuneFrequency;labels();}},250);}
 spec.onclick=e=>queueTune(e,spec);
 water.onclick=e=>queueTune(e,water);$('axisCanvas').onclick=e=>queueTune(e,$('axisCanvas'));
 // Coalesce resizes (window + panel-collapse animation) onto one frame:
