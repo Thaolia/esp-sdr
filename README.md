@@ -2,6 +2,14 @@
 
 ### Try it yourself: [Project overview](https://espargos.net/espsdr/) · [Browser SDR viewer](https://espargos.net/espsdr/app/) · [Browser firmware installer](https://espargos.net/espsdr/app/flash.html)
 
+> **Fork by [Thaolia](https://github.com/Thaolia/esp-sdr).** Live build: **https://thaolia.github.io/esp-sdr/** ([firmware installer](https://thaolia.github.io/esp-sdr/flash.html)). Additions on top of upstream ESP-WebSDR:
+> - **BLE advertising scanner** — on-device GFSK catcher + raw-I/Q decode, all 40 BLE channels labelled.
+> - **ESPsoup (ESP32-C5) firmware support** — mode bar, Panorama/CSPEC, live waterfall, fine tuning.
+> - **Dual-board merge** — combine two boards for a gap-free power waterfall.
+> - **Wi-Fi / BLE channel markers** + **ppm frequency calibration** with sub-bin peak interpolation, mirrored onto the waterfall.
+> - **UI** — viewport-fit spectrum/waterfall, collapsible controls, shrinkable header, debug/UART panel.
+> - **Per-board profiles** and preference for already-granted WebUSB devices.
+
 <img src="docs/espargos-logo.png" width="40%" align="right" alt="ESPARGOS logo">
 
 Browser spectrum viewer and firmware installer for ESP32 chips, with live
