@@ -24,8 +24,6 @@ jobs:
           cp -r index.html flash.html *.js *.css espargos-logo.svg favicon-*.png flasher firmware _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
