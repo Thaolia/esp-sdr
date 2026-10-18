@@ -1,56 +1,206 @@
 'use strict';
 // Direct Web Serial driver. No network requests or server-side processing.
-const CRC_TABLE=Uint32Array.from({length:256},(_,i)=>{let c=i;for(let k=0;k<8;k++)c=c&1?0xedb88320^(c>>>1):c>>>1;return c>>>0;});
-function crc32(bytes){let c=0xffffffff;for(const b of bytes)c=CRC_TABLE[(c^b)&255]^(c>>>8);return (c^0xffffffff)>>>0;}
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, i) => {
+  let c = i;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
 // Yield to the event loop without timers: hidden tabs throttle setTimeout to 1 Hz,
 // which starves the SPEC reader. MessageChannel tasks are not throttled.
 let spectrumYield;
-function yieldTask(){
- if(!spectrumYield){
-  const channel=new MessageChannel(),waiting=[];
-  channel.port1.onmessage=()=>waiting.shift()?.();
-  spectrumYield=()=>new Promise(resolve=>{waiting.push(resolve);channel.port2.postMessage(0);});
- }
- return spectrumYield();
+function yieldTask() {
+  if (!spectrumYield) {
+    const channel = new MessageChannel(),
+      waiting = [];
+    channel.port1.onmessage = () => waiting.shift()?.();
+    spectrumYield = () =>
+      new Promise((resolve) => {
+        waiting.push(resolve);
+        channel.port2.postMessage(0);
+      });
+  }
+  return spectrumYield();
 }
-function fft(re,im){const n=re.length;for(let i=1,j=0;i<n;i++){let bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]];}}for(let len=2;len<=n;len*=2){const a=-2*Math.PI/len,cr=Math.cos(a),ci=Math.sin(a);for(let i=0;i<n;i+=len){let wr=1,wi=0;for(let j=0;j<len/2;j++){const k=i+j,l=k+len/2,tr=re[l]*wr-im[l]*wi,ti=re[l]*wi+im[l]*wr;re[l]=re[k]-tr;im[l]=im[k]-ti;re[k]+=tr;im[k]+=ti;const next=wr*cr-wi*ci;wi=wr*ci+wi*cr;wr=next;}}}}
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len *= 2) {
+    const a = (-2 * Math.PI) / len,
+      cr = Math.cos(a),
+      ci = Math.sin(a);
+    for (let i = 0; i < n; i += len) {
+      let wr = 1,
+        wi = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const k = i + j,
+          l = k + len / 2,
+          tr = re[l] * wr - im[l] * wi,
+          ti = re[l] * wi + im[l] * wr;
+        re[l] = re[k] - tr;
+        im[l] = im[k] - ti;
+        re[k] += tr;
+        im[k] += ti;
+        const next = wr * cr - wi * ci;
+        wi = wr * ci + wi * cr;
+        wr = next;
+      }
+    }
+  }
+}
 // Only one capture is processed at a time; reuse the FFT workspace and window.
 let spectrumWorkspace;
-function spectrum(iq,n){
- if(!spectrumWorkspace||spectrumWorkspace.n!==n){
-  const window=Float64Array.from({length:n},(_,i)=>.5-.5*Math.cos(2*Math.PI*i/(n-1)));
-  spectrumWorkspace={n,window,norm:window.reduce((a,b)=>a+b,0)**2,
-   sums:new Float64Array(n),re:new Float64Array(n),im:new Float64Array(n)};
- }
- const {window,norm,sums,re,im}=spectrumWorkspace,blocks=Math.floor(iq.length/2/n);
- sums.fill(0);
- for(let b=0;b<blocks;b++){
-  let mi=0,mq=0;for(let j=0;j<n;j++){mi+=iq[2*(b*n+j)];mq+=iq[2*(b*n+j)+1];}mi/=n;mq/=n;
-  for(let j=0;j<n;j++){re[j]=(iq[2*(b*n+j)]-mi)*window[j];im[j]=(iq[2*(b*n+j)+1]-mq)*window[j];}
-  fft(re,im);for(let j=0;j<n;j++)sums[j]+=re[j]**2+im[j]**2;
- }
- return Array.from({length:n},(_,j)=>10*Math.log10(Math.max(1e-14,blocks?sums[(j+n/2)%n]/norm/blocks:0)));
+// Where each chip received a test tone over the air (one board per chip, see
+// esp-sdr docs/rx-controls.md). Outside these ranges reception is unlikely.
+const MEASURED_RANGES = {
+  ESP32: [[1850, 2850]],
+  C2: [[1850, 2950]],
+  C3: [[1850, 2750]],
+  C5: [
+    [2200, 2650],
+    [5180, 5800],
+  ],
+  C6: [[1950, 2850]],
+  C61: [[2200, 2850]],
+  H2: [[2300, 2650]],
+  S2: [[1850, 2750]],
+  S3: [[1850, 2750]],
+  S31: [[2150, 2850]],
+};
+
+// Firmware rate codes: the index into this table is the code sent in CAP16/CAP20.
+// WebSerial errors after which the port stays open with a new readable stream.
+const NONFATAL_SERIAL_ERRORS = ['BreakError', 'FramingError', 'ParityError', 'BufferOverrunError'];
+const RATE_CODES = [
+  80000000, 40000000, 20000000, 10000000, 8000000, 4000000, 16000000, 32000000, 10666667, 6400000,
+];
+
+// Decode a CAP16 (8-bit) or CAP20 (packed 10-bit) payload into interleaved
+// float I/Q scaled to +-1. Q is negated so that positive frequencies are above
+// the LO, matching the receiver's mixing convention.
+function decodeIQ(bytes, n, bits) {
+  const iq = new Float32Array(n * 2);
+  if (bits === 8) {
+    for (let j = 0; j < n; j++) {
+      iq[2 * j] = ((bytes[2 * j] << 24) >> 24) / 128;
+      iq[2 * j + 1] = -((bytes[2 * j + 1] << 24) >> 24) / 128;
+    }
+    return iq;
+  }
+  // 10-bit samples are packed LSB first: I in bits 0-9, Q in bits 10-19.
+  let acc = 0,
+    held = 0,
+    k = 0;
+  for (let j = 0; j < n; j++) {
+    while (held < 20) {
+      acc |= bytes[k++] << held;
+      held += 8;
+    }
+    const word = acc & 0xfffff;
+    acc >>>= 20;
+    held -= 20;
+    iq[2 * j] = (((word & 1023) << 22) >> 22) / 512;
+    iq[2 * j + 1] = -(((word >>> 10) << 22) >> 22) / 512;
+  }
+  return iq;
+}
+
+// Fraction of samples with I or Q at the converter's full scale (clipping).
+function clippedFraction(iq, bits) {
+  const limit = bits === 8 ? 127 / 128 : 511 / 512;
+  let clipped = 0;
+  for (let j = 0; j < iq.length; j += 2)
+    if (Math.abs(iq[j]) >= limit || Math.abs(iq[j + 1]) >= limit) clipped++;
+  return iq.length ? clipped / (iq.length / 2) : 0;
+}
+
+function argmax(values) {
+  let best = 0;
+  for (let j = 1; j < values.length; j++) if (values[j] > values[best]) best = j;
+  return best;
+}
+
+function spectrum(iq, n) {
+  if (!spectrumWorkspace || spectrumWorkspace.n !== n) {
+    const window = Float64Array.from(
+      { length: n },
+      (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)),
+    );
+    spectrumWorkspace = {
+      n,
+      window,
+      norm: window.reduce((a, b) => a + b, 0) ** 2,
+      sums: new Float64Array(n),
+      re: new Float64Array(n),
+      im: new Float64Array(n),
+    };
+  }
+  const { window, norm, sums, re, im } = spectrumWorkspace,
+    blocks = Math.floor(iq.length / 2 / n);
+  sums.fill(0);
+  for (let b = 0; b < blocks; b++) {
+    let mi = 0,
+      mq = 0;
+    for (let j = 0; j < n; j++) {
+      mi += iq[2 * (b * n + j)];
+      mq += iq[2 * (b * n + j) + 1];
+    }
+    mi /= n;
+    mq /= n;
+    for (let j = 0; j < n; j++) {
+      re[j] = (iq[2 * (b * n + j)] - mi) * window[j];
+      im[j] = (iq[2 * (b * n + j) + 1] - mq) * window[j];
+    }
+    fft(re, im);
+    for (let j = 0; j < n; j++) sums[j] += re[j] ** 2 + im[j] ** 2;
+  }
+  return Array.from(
+    { length: n },
+    (_, j) => 10 * Math.log10(Math.max(1e-14, blocks ? sums[(j + n / 2) % n] / norm / blocks : 0)),
+  );
 }
 
 // Accumulate linear power until a row is complete. Frames can contain different
 // numbers of FFTs, so an average must be weighted by their actual FFT counts.
 class SpectrumAccumulator {
- constructor(n,maxHold=false){this.power=new Float64Array(n);this.peak=new Float32Array(n).fill(-Infinity);this.weight=0;this.maxHold=maxHold;}
- add(bins,weight=1){
-  if(!(weight>0))return;
-  for(let i=0;i<bins.length;i++){
-   if(bins[i]>this.peak[i])this.peak[i]=bins[i];
-   if(!this.maxHold)this.power[i]+=10**(bins[i]/10)*weight;
+  constructor(n, maxHold = false) {
+    this.power = new Float64Array(n);
+    this.peak = new Float32Array(n).fill(-Infinity);
+    this.weight = 0;
+    this.maxHold = maxHold;
   }
-  this.weight+=weight;
- }
- finish(){
-  if(!this.weight)return null;
-  const peak=this.peak.slice(),weight=this.weight;
-  const bins=this.maxHold?peak.slice():Float32Array.from(this.power,p=>10*Math.log10(Math.max(1e-14,p/weight)));
-  this.power.fill(0);this.peak.fill(-Infinity);this.weight=0;
-  return {bins,peak,weight};
- }
+  add(bins, weight = 1) {
+    if (!(weight > 0)) return;
+    for (let i = 0; i < bins.length; i++) {
+      if (bins[i] > this.peak[i]) this.peak[i] = bins[i];
+      if (!this.maxHold) this.power[i] += 10 ** (bins[i] / 10) * weight;
+    }
+    this.weight += weight;
+  }
+  finish() {
+    if (!this.weight) return null;
+    const peak = this.peak.slice(),
+      weight = this.weight;
+    const bins = this.maxHold
+      ? peak.slice()
+      : Float32Array.from(this.power, (p) => 10 * Math.log10(Math.max(1e-14, p / weight)));
+    this.power.fill(0);
+    this.peak.fill(-Infinity);
+    this.weight = 0;
+    return { bins, peak, weight };
+  }
 }
 // Merges timestamped spectrum frames from one or more devices onto a common host-time grid:
 // every frame that falls in the same rowMs slot (regardless of source) is combined into one
@@ -59,560 +209,1394 @@ class SpectrumAccumulator {
 // time and how many sources contributed. With a single source this is a host-time
 // requantization of that one stream, so the single-device path never needs it.
 class RowMerger {
- constructor(n,maxHold=false,rowMs=33){this.n=n;this.rowMs=Math.max(1,rowMs||1);this.acc=new SpectrumAccumulator(n,maxHold);this.slotT=null;this.slotSources=new Set();this.out=[];}
- add(bins,weight,hostT,source){
-  if(!bins||bins.length!==this.n)return;
-  if(this.slotT!==null&&hostT-this.slotT>=this.rowMs)this.flush();
-  if(this.slotT===null)this.slotT=hostT;
-  this.acc.add(bins,weight>0?weight:1);this.slotSources.add(source);
- }
- flush(){
-  const row=this.acc.finish();
-  if(row){row.t=this.slotT;row.sources=this.slotSources.size;this.out.push(row);}
-  this.slotT=null;this.slotSources.clear();
- }
- drain(){const r=this.out;this.out=[];return r;}
+  constructor(n, maxHold = false, rowMs = 33) {
+    this.n = n;
+    this.rowMs = Math.max(1, rowMs || 1);
+    this.acc = new SpectrumAccumulator(n, maxHold);
+    this.slotT = null;
+    this.slotSources = new Set();
+    this.out = [];
+  }
+  add(bins, weight, hostT, source) {
+    if (!bins || bins.length !== this.n) return;
+    if (this.slotT !== null && hostT - this.slotT >= this.rowMs) this.flush();
+    if (this.slotT === null) this.slotT = hostT;
+    this.acc.add(bins, weight > 0 ? weight : 1);
+    this.slotSources.add(source);
+  }
+  flush() {
+    const row = this.acc.finish();
+    if (row) {
+      row.t = this.slotT;
+      row.sources = this.slotSources.size;
+      this.out.push(row);
+    }
+    this.slotT = null;
+    this.slotSources.clear();
+  }
+  drain() {
+    const r = this.out;
+    this.out = [];
+    return r;
+  }
 }
 // Accept calendar dates from older catalogs and precise UTC timestamps from
 // new builds. Reject rollover dates rather than silently normalizing them.
-function firmwareDateValue(value){
- if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(value))return null;
- const time=Date.parse(value.length===10?value+'T00:00:00Z':value);
- if(!Number.isFinite(time))return null;
- const canonical=new Date(time).toISOString();
- return (value.length===10?canonical.slice(0,10):canonical.replace('.000Z','Z'))===value?time:null;
+function firmwareDateValue(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(value)) return null;
+  const time = Date.parse(value.length === 10 ? value + 'T00:00:00Z' : value);
+  if (!Number.isFinite(time)) return null;
+  const canonical = new Date(time).toISOString();
+  return (value.length === 10 ? canonical.slice(0, 10) : canonical.replace('.000Z', 'Z')) === value
+    ? time
+    : null;
 }
-function firmwareUpdateStatus(installed,manifest){
- if(installed?.status==='missing')return {status:'outdated',message:'This firmware does not report its version. Update the firmware to the latest build.'};
- if(installed?.status!=='known')return {status:'unknown',message:'Firmware version could not be read.'};
- const latest=manifest?.schema_version===1?manifest.variants?.[installed.profile]:null;
- if(!latest||latest.target!==installed.profile||latest.application==='soapysdr')return {status:'unknown',message:'No matching firmware build was found in the update catalog.'};
- const precise=latest.build_timestamp!==undefined;
- const newer=firmwareDateValue(precise?latest.build_timestamp:latest.build_date);
- const current=firmwareDateValue(precise?installed.build_timestamp:installed.build_date);
- if(newer===null||current===null)return {status:'unknown',message:'Firmware build dates could not be compared.'};
- return newer>current
-  ?{status:'outdated',message:`A newer firmware build is available (${precise?latest.build_timestamp:latest.build_date}). Installed: ${installed.build_timestamp} (${installed.revision}).`}
-  :{status:'current',message:''};
+function firmwareUpdateStatus(installed, manifest) {
+  if (installed?.status === 'missing')
+    return {
+      status: 'outdated',
+      message: 'This firmware does not report its version. Update the firmware to the latest build.',
+    };
+  if (installed?.status !== 'known')
+    return { status: 'unknown', message: 'Firmware version could not be read.' };
+  const latest = manifest?.schema_version === 1 ? manifest.variants?.[installed.profile] : null;
+  if (!latest || latest.target !== installed.profile || latest.application === 'soapysdr')
+    return { status: 'unknown', message: 'No matching firmware build was found in the update catalog.' };
+  const precise = latest.build_timestamp !== undefined;
+  const newer = firmwareDateValue(precise ? latest.build_timestamp : latest.build_date);
+  const current = firmwareDateValue(precise ? installed.build_timestamp : installed.build_date);
+  if (newer === null || current === null)
+    return { status: 'unknown', message: 'Firmware build dates could not be compared.' };
+  return newer > current
+    ? {
+        status: 'outdated',
+        message: `A newer firmware build is available (${precise ? latest.build_timestamp : latest.build_date}). Installed: ${installed.build_timestamp} (${installed.revision}).`,
+      }
+    : { status: 'current', message: '' };
 }
 class BurstSerialRadio {
- constructor(){this.maxSamples=16380;this.captureSamples=null;this.droppedCaptures=0;this.spectrumCrcErrors=0;this.baudRate=2000000;this.transport=null;this.supportsBaudChange=false;this.changingBaud=false;this.hasGpio=false;this.gpioPins=[];this.firmwareVersion=null;this.gainMin=0;this.gainMax=0;this.gainStep=1;this.bandwidthRange=null;this.sampleBits=[8,10];this.family="C5";this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=false;this.hasFreqk=false;this.hasTemp=false;this.hasFwopt=false;this.hasSweep=false;this.hasCspec=false;this.hasCgrid=false;this.hasCont=false;this.hasGfsk=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;this.rxRates=[80000000,40000000,20000000,10000000,8000000,4000000];this.port=null;this.queue=[];this.queued=0;this.wake=null;this.reader=null;this.writer=null;this.failed=null;this.tail=Promise.resolve();this.sequence=0;this.last=null;this.frequency=null;this.filter=null;this.analogFilter=null;this.bandwidth=null;this.gainSetting=null;}
- run(f){const p=this.tail.then(f);this.tail=p.catch(()=>{});return p;}
- async pump(){try{for(;;){const {value,done}=await this.reader.read();if(done)break;if(value){this.queue.push(value);this.queued+=value.length;if(this.lossy&&this.queued>1048576){while(this.queued>262144){const b=this.queue.shift();this.queued-=b.length;this.hostDropped+=b.length;}}if(this.queued>2*1024*1024)throw Error('Serial receive queue overflow');if(this.wake)this.wake();}}}catch(e){this.failed=e;}finally{this.failed ||= Error('Device disconnected');if(this.wake)this.wake();}}
- async read(n,deadline=performance.now()+5000,idleMs=Infinity){let idleDeadline=performance.now()+idleMs;const out=new Uint8Array(n);let offset=0;while(offset<n){if(this.queued){const b=this.queue[0],k=Math.min(n-offset,b.length);out.set(b.subarray(0,k),offset);offset+=k;this.queued-=k;idleDeadline=performance.now()+idleMs;if(k===b.length)this.queue.shift();else this.queue[0]=b.subarray(k);continue;}if(this.failed)throw this.failed;const ms=Math.min(deadline,idleDeadline)-performance.now();if(ms<=0)throw Object.assign(Error('Serial response timed out'),{code:'SERIAL_TIMEOUT'});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.wake=null;reject(Object.assign(Error('Serial response timed out'),{code:'SERIAL_TIMEOUT'}));},ms);this.wake=()=>{clearTimeout(timer);this.wake=null;resolve();};});}return out;}
- async line(prefix='',limit=256){let s='',end=performance.now()+5000;for(let j=0;j<limit;j++){const b=(await this.read(1,end))[0];if(b===10){s=s.trim();this.onwire?.('rx',s);if(!s.startsWith(prefix))throw Error(s||'Empty serial response');return s;}s+=String.fromCharCode(b);}throw Object.assign(Error('Invalid serial header'),{code:'CAPTURE_DAMAGED'});}
- async command(s){this.onwire?.('tx',s);await this.writer.write(new TextEncoder().encode(s+'\n'));}
- async synchronize(){
-  // Opening a UART bridge or native serial port can reset the board. A command
-  // sent during boot is lost, so retry with a fresh marker after draining logs.
-  for(let attempt=0;attempt<3;attempt++){
-   const marker='SYNC '+Date.now(),deadline=performance.now()+2000;
-   await this.command('\n'+marker);let window='';
-   try{
-    for(let j=0;j<70000;j++){
-     window+=String.fromCharCode((await this.read(1,deadline))[0]);
-     if(window.length>marker.length+1)window=window.slice(-marker.length-1);
-     if(window===marker+'\n')return;
+  constructor() {
+    this.maxSamples = 16380;
+    this.captureSamples = null;
+    this.droppedCaptures = 0;
+    this.spectrumCrcErrors = 0;
+    this.baudRate = 2000000;
+    this.transport = null;
+    this.supportsBaudChange = false;
+    this.changingBaud = false;
+    this.hasGpio = false;
+    this.gpioPins = [];
+    this.firmwareVersion = null;
+    this.gainMin = 0;
+    this.gainMax = 0;
+    this.gainStep = 1;
+    this.bandwidthRange = null;
+    this.sampleBits = [8, 10];
+    this.family = 'C5';
+    this.hasExtendedTune = false;
+    this.tuneRange = null;
+    this.hasBigcap = false;
+    this.hasFreqk = false;
+    this.hasTemp = false;
+    this.hasFwopt = false;
+    this.hasSweep = false;
+    this.hasCspec = false;
+    this.hasCgrid = false;
+    this.hasCont = false;
+    this.hasGfsk = false;
+    this.fwopt = null;
+    this.maxBigSamples = null;
+    this.freqStepHz = null;
+    this.lockRanges = null;
+    this.rxRates = [80000000, 40000000, 20000000, 10000000, 8000000, 4000000];
+    this.port = null;
+    this.queue = [];
+    this.queued = 0;
+    this.wake = null;
+    this.reader = null;
+    this.writer = null;
+    this.failed = null;
+    this.tail = Promise.resolve();
+    this.sequence = 0;
+    this.last = null;
+    this.frequency = null;
+    this.filter = null;
+    this.analogFilter = null;
+    this.bandwidth = null;
+    this.gainSetting = null;
+  }
+  run(f) {
+    const p = this.tail.then(f);
+    this.tail = p.catch(() => {});
+    return p;
+  }
+  async pump() {
+    try {
+      for (;;) {
+        let chunk;
+        try {
+          chunk = await this.reader.read();
+        } catch (e) {
+          // A break or framing error ends the stream but not the port. UART
+          // bridges report one while the board is held in reset, so continue
+          // with a fresh reader; SYNC markers and CRCs catch the damage.
+          if (!NONFATAL_SERIAL_ERRORS.includes(e?.name) || !this.port?.readable) throw e;
+          this.reader.releaseLock();
+          this.reader = this.port.readable.getReader();
+          continue;
+        }
+        const { value, done } = chunk;
+        if (done) break;
+        if (value) {
+          this.queue.push(value);
+          this.queued += value.length;
+          if (this.lossy && this.queued > 1048576) {
+            while (this.queued > 262144) {
+              const b = this.queue.shift();
+              this.queued -= b.length;
+              this.hostDropped += b.length;
+            }
+          }
+          if (this.queued > 2 * 1024 * 1024) throw Error('Serial receive queue overflow');
+          if (this.wake) this.wake();
+        }
+      }
+    } catch (e) {
+      this.failed = e;
+    } finally {
+      this.failed ||= Error('Device disconnected');
+      if (this.wake) this.wake();
     }
-   }catch(e){if(this.failed)throw e;}
   }
-  throw Error('SDR synchronization failed. Unplug your ESP32 device and plug it back in, then try connecting again. Check the UART baud setting, install ESP-SDR firmware, and close other SDR clients.');
- }
- async startUartFirmware(){
-  // USB/UART bridges wire DTR to GPIO0 and RTS to EN. A previous flasher or
-  // port-open transition can leave the ESP32 in reset or the ROM downloader.
-  // Native USB ports must not receive this external-UART reset sequence.
-  const vendor=this.port.getInfo?.().usbVendorId;
-  if(![0x10c4,0x1a86,0x0403,0x067b].includes(vendor))return;
-  await this.port.setSignals({dataTerminalReady:false,requestToSend:true});
-  try{await new Promise(resolve=>setTimeout(resolve,100));}
-  finally{await this.port.setSignals({dataTerminalReady:false,requestToSend:false});}
- }
- async openPort(port,baudRate){
-  this.port=port;
-  await port.open({baudRate,bufferSize:131072,flowControl:'none'});
-  this.baudRate=baudRate;this.reader=port.readable.getReader();this.writer=port.writable.getWriter();
-  this.queue=[];this.queued=0;this.failed=null;this.pumping=this.pump();
- }
- async closePort(){
-  if(this.reader){await this.reader.cancel().catch(()=>{});await this.pumping;this.reader.releaseLock();this.reader=null;}
-  if(this.writer){this.writer.releaseLock();this.writer=null;}
-  if(this.port){await this.port.close().catch(()=>{});this.port=null;}
-  this.frequency=null;this.filter=null;this.analogFilter=null;this.bandwidth=null;this.gainSetting=null;this.last=null;
- }
- async connectPort(port,baudRate,reset=true){
-  // Only an initial connection resets the board. A baud switch must preserve
-  // the running firmware and its volatile UART rate.
-  const rates=port.getInfo?.().usbVendorId===0x303a?[baudRate]:[...new Set([baudRate,2000000,1000000])];
-  let failure;
-  for(const rate of rates){
-   try{
-    await this.openPort(port,rate);
-    if(reset)await this.startUartFirmware();
-    else{
-     // Release EN (RTS) before GPIO0 (DTR): sequential signal updates in
-     // the opposite order can reset the board and lose its runtime baud.
-     await port.setSignals({requestToSend:false});
-     await port.setSignals({dataTerminalReady:false});
+  async read(n, deadline = performance.now() + 5000, idleMs = Infinity) {
+    let idleDeadline = performance.now() + idleMs;
+    const out = new Uint8Array(n);
+    let offset = 0;
+    while (offset < n) {
+      if (this.queued) {
+        const b = this.queue[0],
+          k = Math.min(n - offset, b.length);
+        out.set(b.subarray(0, k), offset);
+        offset += k;
+        this.queued -= k;
+        idleDeadline = performance.now() + idleMs;
+        if (k === b.length) this.queue.shift();
+        else this.queue[0] = b.subarray(k);
+        continue;
+      }
+      if (this.failed) throw this.failed;
+      const ms = Math.min(deadline, idleDeadline) - performance.now();
+      if (ms <= 0) throw Object.assign(Error('Serial response timed out'), { code: 'SERIAL_TIMEOUT' });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.wake = null;
+          reject(Object.assign(Error('Serial response timed out'), { code: 'SERIAL_TIMEOUT' }));
+        }, ms);
+        this.wake = () => {
+          clearTimeout(timer);
+          this.wake = null;
+          resolve();
+        };
+      });
     }
-    await this.synchronize();return;
-   }
-   catch(e){failure=e;await this.closePort();}
+    return out;
   }
-  throw failure;
- }
- async connect({baudRate=2000000,port=null}={}){
-  if(!port&&!SerialConnection.supported())throw Error('WebSerial or WebUSB support is required in this browser.');
-  if(!isSecureContext)throw Error('Serve this page over HTTPS or localhost.');
-  if(!port)port=await SerialConnection.requestPort();
-  return this.run(async()=>{
-   await this.close();
-   try{await this.connectPort(port,baudRate);return await this.negotiate();}
-   catch(e){await this.close();throw e;}
-  });
- }
- async negotiateSpectrum(caps){
-  this.specCapabilities=null;
-  if(!this.hasSpec)return;
-  if(caps.split(' ').includes('SPECCAPS')){
-   await this.command('SPECINFO?');
-   this.applySpectrumCapabilities(await this.line('SPECINFO ',4096));
-  }else if(this.family==='S3'){
-   // Compatibility with the original S3 contribution.
-   const profiles=[[16000000,6,256,4,1],[40000000,1,256,12,3],[80000000,0,256,48,5]];
-   if(this.hasSpecN)profiles.push([16000000,6,1024,8,4],[16000000,6,2048,6,8],[40000000,1,1024,18,10],[40000000,1,2048,10,20]);
-   this.specCapabilities={continuous:true,transports:['USB'],profiles};
+  async line(prefix = '', limit = 256) {
+    let s = '',
+      end = performance.now() + 5000;
+    for (let j = 0; j < limit; j++) {
+      const b = (await this.read(1, end))[0];
+      if (b === 10) {
+        s = s.trim();
+        this.onwire?.('rx', s);
+        if (!s.startsWith(prefix)) throw Error(s || 'Empty serial response');
+        return s;
+      }
+      s += String.fromCharCode(b);
+    }
+    throw Object.assign(Error('Invalid serial header'), { code: 'CAPTURE_DAMAGED' });
   }
- }
- applySpectrumCapabilities(line){
-  let c;try{c=JSON.parse(line.slice(9));}catch{throw Error('Invalid spectrum capabilities');}
-  if(typeof c?.continuous!=='boolean'||!Array.isArray(c.transports)||!c.transports.length||
-     c.transports.some(t=>!['USB','UART'].includes(t))||!Array.isArray(c.profiles)||!c.profiles.length||c.profiles.length>64||
-     c.profiles.some(p=>!Array.isArray(p)||(p.length!==5&&p.length!==6)||p.some(v=>!Number.isInteger(v))||
-      !this.rxRates.includes(p[0])||p[1]<0||p[1]>9||![256,512,1024,2048].includes(p[2])||p[3]<1||p[3]>64||p[4]<1||p[4]>1000||(p.length===6&&p[5]!==0&&p[5]!==1)))
-   throw Error('Invalid spectrum capabilities');
-  this.specCapabilities=c;
- }
- get canStreamSpectrum(){return this.hasSpec&&!!this.specCapabilities?.transports.includes(this.transport);}
- spectrumContinuous(rate,n){const p=this.spectrumProfiles(rate).find(p=>p[2]===n);return p?.length===6?!!p[5]:!!this.specCapabilities?.continuous;}
- spectrumProfiles(rate){return this.specCapabilities?.profiles.filter(p=>p[0]===rate)||[];}
- async negotiate(){await this.command('INFO');this.identity=await this.line();this.applyIdentity(this.identity);await this.command('CAPS');const caps=await this.line('',1024);this.supportsBaudChange=false;this.transport=null;if(caps.split(' ').includes('UARTBAUD')){await this.command('TRANSPORT?');const t=/^TRANSPORT (UART|USB) (\d+)$/.exec(await this.line());if(!t||(t[1]==='UART'?Number(t[2])!==this.baudRate:Number(t[2])!==0))throw Error('Invalid serial transport response');this.transport=t[1];this.supportsBaudChange=this.transport==='UART';}if(this.family==='S3')this.rxRates=[80000000,...(caps.split(' ').includes('RX40')?[40000000]:[]),...(caps.split(' ').includes('RX16')?[16000000]:[])];this.hasSerialLease=caps.split(' ').some(c=>c==='SERIALLEASE'||c==='DUALSERIAL');this.hasExtendedTune=caps.split(' ').includes('TUNEEXT');this.tuneRange=null;if(this.hasExtendedTune){await this.command('RANGE?');const h=(await this.line('RANGE ')).split(' '),lo=Number(h[1]),hi=Number(h[2]);if(h.length!==4||!Number.isInteger(lo)||!Number.isInteger(hi)||lo<100||hi>6000||lo>=hi||h[3]!=='1')throw Error('Invalid tuning range');this.tuneRange=[lo,hi];}this.hasAnalogFilter=caps.split(' ').includes('LPFANA');this.hasAnalogBandwidth=this.family!=='S3'&&caps.split(' ').includes('ALPF');this.hasFilter12=this.family!=='S3'&&caps.split(' ').includes('LPF12');this.hasFilter=caps.split(' ').includes('LPF')||this.hasAnalogFilter;this.hasGain=caps.split(' ').includes('GAIN');this.hasSpec=caps.split(' ').includes('SPEC');this.hasSpecN=caps.split(' ').includes('SPECN');this.hasSpecStats=caps.split(' ').includes('SPECSTAT');this.hasHardwareAgc=caps.split(' ').includes('HWAGC');this.hasBigcap=caps.split(' ').includes('BIGCAP');this.hasFreqk=caps.split(' ').includes('FREQK');this.hasTemp=caps.split(' ').includes('TEMP');this.hasFwopt=caps.split(' ').includes('FWOPT');this.hasSweep=caps.split(' ').includes('SWEEP');this.hasCspec=caps.split(' ').includes('CSPEC');this.hasCgrid=caps.split(' ').includes('CGRID');this.hasCont=caps.split(' ').includes('CONT');this.hasGfsk=caps.split(' ').includes('GFSKPKT');if(caps.split(' ').includes('RXLIMITS')){await this.command('LIMITS?');this.applyLimits(await this.line('LIMITS ',4096));}else{await this.command('GAIN?');const g=(await this.line('GAIN ')).split(' ');this.applyLimits('LIMITS '+JSON.stringify({gain:[Number(g[3]),Number(g[4]),1],bandwidth:null,rates:this.rxRates,bits:[8,10]}));}await this.negotiateVersion(caps);await this.negotiateFwopt();await this.negotiateGpio(caps);await this.negotiateSpectrum(caps);this.deviceName=this.family==='ESP32'?'ESP32':'ESP32-'+this.family;return {identity:this.identity,port:this.deviceName,family:this.family,filter:this.hasFilter};}
- async negotiateVersion(caps){
-  this.firmwareVersion={status:'missing'};
-  if(!caps.split(' ').includes('VERSION'))return;
-  await this.command('VERSION?');const line=await this.line('',512);
-  if(line==='ERR command')return;
-  this.firmwareVersion={status:'unknown'};
-  try{
-   if(!line.startsWith('VERSION '))return;
-   const value=JSON.parse(line.slice(8)),profile=this.family==='ESP32'?'esp32':'esp32'+this.family.toLowerCase();
-   if(value.profile!==profile||typeof value.revision!=='string'||!/^(?:[a-f0-9]{7,40}(?:-dirty)?|unknown)$/.test(value.revision)||
-      firmwareDateValue(value.build_timestamp)===null||value.build_timestamp.length!==20||
-      value.build_date!==value.build_timestamp.slice(0,10))return;
-   this.firmwareVersion={...value,status:'known'};
-  }catch{/* Malformed optional metadata must not prevent reception. */}
- }
- async negotiateFwopt(){
-  this.fwopt=null;
-  if(!this.hasFwopt)return;
-  await this.command('FWOPT?');
-  const line=await this.line('',128);
-  if(!line.startsWith('FWOPT '))return;
-  this.fwopt=line.slice(6).trim();
-  // ESPsoup reports its build through FWOPT, not the VERSION JSON. Treat that as a
-  // known identity so the update banner never tells the user to "update" newer firmware.
-  if(this.firmwareVersion?.status==='missing')this.firmwareVersion={status:'espsoup',fwopt:this.fwopt};
- }
- async negotiateGpio(caps){
-  this.hasGpio=caps.split(' ').includes('GPIO');this.gpioPins=[];
-  if(!this.hasGpio)return;
-  await this.command('GPIO?');
-  const line=await this.line('',512);
-  if(!/^GPIO(?: (?:0|[1-9][0-9]?):[Z01])*$/.test(line))throw Error('Invalid GPIO response');
-  const pins=line.slice(4).trim();
-  this.gpioPins=pins?pins.split(' ').map(entry=>{const [pin,state]=entry.split(':');return {pin:Number(pin),state};}):[];
-  if(this.gpioPins.some((p,i)=>p.pin>63||(i&&p.pin<=this.gpioPins[i-1].pin))){this.gpioPins=[];throw Error('Invalid GPIO pin list');}
- }
- async setGpio(pin,state){return this.run(async()=>{
-  const entry=this.gpioPins.find(p=>p.pin===pin);
-  if(!this.hasGpio||!entry||!['Z','0','1'].includes(state))throw Error('Invalid GPIO setting');
-  await this.command(`GPIO ${pin} ${state}`);
-  const response=await this.line();
-  if(response!==`OK GPIO ${pin} ${state}`)throw Error(response.startsWith('ERR ')?response:'Invalid GPIO acknowledgement');
-  entry.state=state;
- });}
- async setBaudRate(baudRate){return this.run(async()=>{
-  this.changingBaud=true;
-  try{
-   if(!this.port||!this.supportsBaudChange||this.transport!=='UART')throw Error('Update ESP-SDR firmware to enable UART baud changes.');
-   if(![1000000,2000000].includes(baudRate))throw Error('Choose 1 or 2 MBaud.');
-   if(baudRate===this.baudRate)return;
-   const port=this.port;
-   await this.synchronize();
-   await this.command(`BAUD ${baudRate}`);
-   let acknowledgement;
-   try{acknowledgement=await this.line();}catch(e){
-    // The ACK can itself lose bytes. Probe the port at both rates below.
-    if(e.code!=='SERIAL_TIMEOUT'&&e.code!=='CAPTURE_DAMAGED')throw e;
-   }
-   if(acknowledgement?.startsWith('ERR '))throw Error(acknowledgement);
-   // Do not send LPF/RELEASE here: the device may already use the new baud.
-   await this.closePort();
-   try{await this.connectPort(port,baudRate,false);await this.negotiate();}
-   catch(e){await this.close();throw e;}
-   if(this.transport!=='UART'||this.baudRate!==baudRate)throw Error('The device did not retain the requested baud rate; it may have reset during port reopen. The default connection was recovered.');
-  }catch(e){if(this.failed)await this.close();throw e;}finally{this.changingBaud=false;}
- });}
- applyIdentity(identity){
-  const m=/^(ESP32|C2|C3|C5|C6|C61|H2|S2|S3|S31)SDR 6 burst (\d+)$/.exec(identity);
-  const n=m?Number(m[2]):0;
-  if(!m||!Number.isInteger(n)||n<4096||n>16384)throw Error('Unsupported SDR firmware: '+identity);
-  this.family=m[1];this.maxSamples=n;this.captureSamples=null;this.droppedCaptures=0;this.spectrumCrcErrors=0;
-  this.rxRates=this.family==='H2'?[32000000,16000000,10666667,6400000]:this.family==='ESP32'?[80000000,40000000,16000000]:this.family==='S31'?[16000000,8000000,4000000]:(this.family==='C2'||this.family==='C3'||this.family==='S3'||this.family==='S2'||this.family==='C6')?[80000000]:[80000000,40000000,20000000,10000000,8000000,4000000];
- }
- applyLimits(line){
-  let limits;try{limits=JSON.parse(line.slice(7));}catch{throw Error('Invalid receiver limits');}
-  const range=(r,max)=>Array.isArray(r)&&r.length===3&&r.every(Number.isInteger)&&r[0]>=0&&r[1]>=r[0]&&r[1]<=max&&r[2]>0&&r[2]<=Math.max(1,r[1]-r[0])&&(r[1]-r[0])%r[2]===0;
-  const g=limits?.gain,b=limits?.bandwidth,rates=limits?.rates,bits=limits?.bits;
-  if(!line.startsWith('LIMITS ')||!range(g,127)||!(b===null||(Array.isArray(b)&&b.length===4&&range(b.slice(0,3),1000)&&b[0]>0&&Number.isInteger(b[3])&&(b[3]===0||(b[3]>=b[0]&&b[3]<=b[1]&&(b[3]-b[0])%b[2]===0))))||!Array.isArray(rates)||!rates.length||rates.some(r=>![80000000,40000000,20000000,10000000,8000000,4000000,16000000,32000000,10666667,6400000].includes(r))||new Set(rates).size!==rates.length||!Array.isArray(bits)||!bits.length||bits.some(b=>![8,10].includes(b))||new Set(bits).size!==bits.length)throw Error('Invalid receiver limits');
-  [this.gainMin,this.gainMax,this.gainStep]=g;this.bandwidthRange=b;this.rxRates=rates;this.sampleBits=bits;
-  // Optional ESPsoup extensions: ignored silently when absent or malformed.
-  const ms=limits.maxSamples;this.maxBigSamples=Number.isInteger(ms)&&ms>this.maxSamples&&ms<=262144?ms:null;
-  const fs=limits.freqStepHz;this.freqStepHz=Number.isInteger(fs)&&fs>0&&fs<=1000000&&1000000%fs===0?fs:null;
-  const lm=limits.lockMHz;this.lockRanges=Array.isArray(lm)&&lm.length&&lm.every(r=>Array.isArray(r)&&r.length===2&&Number.isInteger(r[0])&&Number.isInteger(r[1])&&r[0]<r[1])?lm:null;
- }
- async close(){if(this.writer&&this.reader&&!this.failed&&this.hasFilter){try{await this.command('LPF AUTO');await this.line('OK');}catch(e){/* Disconnect still releases USB after a lost response. */}}if(this.writer&&this.reader&&!this.failed&&this.hasAnalogBandwidth){try{await this.command('ALPF AUTO');await this.line('OK');}catch(e){}}if(this.hasSerialLease&&this.writer&&this.reader&&!this.failed){try{await this.command('RELEASE');await this.line('OK');}catch(e){/* Idle ownership expires if the port disappears. */}}this.firmwareVersion=null;this.hasGpio=false;this.gpioPins=[];this.hasSerialLease=false;this.hasExtendedTune=false;this.tuneRange=null;this.hasBigcap=this.hasFreqk=this.hasTemp=this.hasFwopt=this.hasSweep=this.hasCspec=this.hasCgrid=this.hasCont=this.hasGfsk=false;this.fwopt=null;this.maxBigSamples=null;this.freqStepHz=null;this.lockRanges=null;await this.closePort();this.transport=null;this.supportsBaudChange=false;}
- validFrequency(f){
-  if(typeof f!=='number'||!Number.isFinite(f))return false;
-  // With FREQK the grid is 1 kHz; otherwise whole MHz (same as the historical integer check).
-  const stepHz=this.hasFreqk&&this.freqStepHz?this.freqStepHz:1000000;
-  if(Math.abs(Math.round(f*1000000/stepHz)*stepHz-f*1000000)>0.5)return false;
-  if(this.hasExtendedTune)return !!this.tuneRange&&f>=this.tuneRange[0]&&f<=this.tuneRange[1];
-  // Only firmware without TUNEEXT needs the historical family defaults.
-  if(this.family==='ESP32')return f>=2412&&f<=2472&&(f-2412)%5===0;
-  if(this.family==='S31')return f>=2300&&f<=2800;
-  if(this.family==='C61')return f>=2400&&f<=2500;
-  if(this.family==='C5')return (f>=2100&&f<=2700)||(f>=4800&&f<=6000);
-  return (f>=2412&&f<=2472&&(f-2412)%5===0)||f===2484;
- }
- frequencyWarning(f){
-  if(!this.validFrequency(f)||(f>=2400&&f<=2483.5)||(this.family==='C5'&&f>=5150&&f<=5895))return '';
-  return this.family==='C5'?'Outside the 2.4 GHz ISM band and the supported 5 GHz Wi-Fi band. The PLL may not lock, and the spectrum may not match the selected center frequency.':'Outside the 2.4 GHz ISM band. The PLL may not lock, and the spectrum may not match the selected center frequency.';
- }
- nearestFrequency(f){
-  const stepHz=this.hasFreqk&&this.freqStepHz?this.freqStepHz:1000000;
-  f=Math.round(f*1000000/stepHz)*stepHz/1000000;
-  if(this.hasExtendedTune&&this.tuneRange)return Math.max(this.tuneRange[0],Math.min(this.tuneRange[1],f));
-  // Compatibility with firmware predating range negotiation.
-  if(this.family==='C61')return Math.max(2400,Math.min(2500,f));
-  if(this.family==='S31')return Math.max(2300,Math.min(2800,f));
-  if(this.family==='C5'){
-   const ranges=[[2100,2700],[4800,6000]];
-   return ranges.map(([lo,hi])=>Math.max(lo,Math.min(hi,f))).reduce((a,b)=>Math.abs(a-f)<=Math.abs(b-f)?a:b);
+  async command(s) {
+    this.onwire?.('tx', s);
+    await this.writer.write(new TextEncoder().encode(s + '\n'));
   }
-  const channels=Array.from({length:13},(_,i)=>2412+i*5);
-  if(this.family!=='ESP32')channels.push(2484);
-  return channels.reduce((a,b)=>Math.abs(a-f)<=Math.abs(b-f)?a:b);
- }
- frequencyInput(){
-  const step=this.hasFreqk&&this.freqStepHz?this.freqStepHz/1000000:1;
-  if(this.hasExtendedTune&&this.tuneRange)return {min:this.tuneRange[0],max:this.tuneRange[1],step};
-  if(this.family==='ESP32')return {min:2412,max:2472,step:5};
-  if(this.family==='C61')return {min:2400,max:2500,step:1};
-  if(this.family==='S31')return {min:2300,max:2800,step:1};
-  return this.family==='C5'?{min:2100,max:6000,step}:{min:2412,max:2484,step:1};
- }
- async tune(frequency,bandwidth=0){
-  if(!this.validFrequency(frequency))throw Error(this.hasExtendedTune?`Choose a center frequency from ${this.tuneRange[0]} to ${this.tuneRange[1]} MHz${this.hasFreqk&&this.freqStepHz?' in '+(this.freqStepHz<1000?this.freqStepHz+' Hz':this.freqStepHz/1000+' kHz')+' steps':' (whole MHz)'}.`:this.family==='ESP32'?'Choose a Wi-Fi channel center from 2412 to 2472 MHz in 5 MHz steps.':'This firmware cannot attempt that center frequency. Install updated firmware for extended tuning.');
-  if(!this.port)throw Error('Connect the SDR first.');
-  const range=this.bandwidthRange;
-  if(!Number.isInteger(bandwidth)||bandwidth<0||(bandwidth!==0&&(!range||bandwidth<range[0]||bandwidth>range[1]||(bandwidth-range[0])%range[2]!==0)))throw Error(range?`Choose an analog bandwidth from ${range[0]} to ${range[1]} MHz.`:'Manual analog bandwidth is not characterized for this firmware.');
-  if(this.frequency!==frequency){this.frequency=null;
-   // FREQK tunes in 1 kHz steps for a fractional MHz; FREQ (whole MHz) also resets the kHz offset.
-   if(this.hasFreqk&&!Number.isInteger(frequency))await this.command('FREQK '+Math.round(frequency*1000));
-   else await this.command('FREQ '+frequency);
-   await this.line('OK');this.frequency=frequency;}
-  if(range&&this.bandwidth!==bandwidth){await this.command('BANDWIDTH '+bandwidth);await this.line('OK');this.bandwidth=bandwidth;}
- }
- async setGain(mode='HARDWARE',code=40){if(!['HARDWARE','MANUAL'].includes(mode)||!Number.isInteger(code)||code<this.gainMin||code>this.gainMax||(code-this.gainMin)%this.gainStep!==0)throw Error(`Choose a gain index from ${this.gainMin} to ${this.gainMax}.`);if(!this.hasGain)throw Error('Update SDR firmware for gain control.');if(mode==='HARDWARE'&&!this.hasHardwareAgc)throw Error('Update SDR firmware for hardware AGC.');const setting=mode==='MANUAL'?'MANUAL '+code:mode;if(setting!==this.gainSetting){await this.command('GAIN '+setting);await this.line('OK');this.gainSetting=setting;}await this.command('GAIN?');const h=(await this.line('GAIN ')).split(' ');if(!['HARDWARE','MANUAL'].includes(h[1])||!Number.isInteger(Number(h[2])))throw Error('Invalid gain response');return {mode:h[1],index:h[1]==='HARDWARE'?null:Number(h[2])};}
- async temperature(){return this.run(async()=>{
-  if(!this.hasTemp||!this.writer)return null;
-  await this.command('TEMP?');
-  const m=/^TEMP (-?\d+(?:\.\d+)?)$/.exec(await this.line('',48));
-  return m?Number(m[1]):null;
- });}
- // ESPsoup diagnostics snapshot for the debug panel. Only control-plane queries;
- // callers must avoid it mid-stream (any host line stops SPEC/CSPEC/SWEEP).
- async diagnostics(){return this.run(async()=>{
-  if(!this.writer||!this.hasFwopt)return null;
-  const out={fwopt:this.fwopt};
-  const q=async cmd=>{await this.command(cmd);return this.line('',128);};
-  try{const m=/^TEMP (-?\d+(?:\.\d+)?)$/.exec(await q('TEMP?'));if(m)out.temp=Number(m[1]);}catch(e){}
-  try{const m=/^HEAP (\d+) (\d+)$/.exec(await q('HEAP?'));if(m){out.heapFree=Number(m[1]);out.heapLargest=Number(m[2]);}}catch(e){}
-  try{const m=/^TUNEM (\d+)$/.exec(await q('TUNEM?'));if(m)out.tunem=Number(m[1]);}catch(e){}
-  try{const m=/^ENGINE (\w+)$/.exec(await q('ENGINE?'));if(m)out.engine=m[1];}catch(e){}
-  return out;
- });}
- // ESPsoup continuous-engine time grid. CGRID anchors continuous block starts to a grid so
- // two boards can cover each other's gaps; "CGRID 0 0" is free-running. Reply OK. Set it before
- // cspec(). CADJ (phase steering) is valid only during a run, so it is issued from the cspec
- // loop's steering hook, not as a standalone command (idle CADJ returns "ERR command").
- async cgrid(t0,period){return this.run(async()=>{
-  if(!this.hasCgrid)throw Error('Continuous grid control is unavailable on this firmware.');
-  if(!Number.isInteger(t0)||t0<0||!Number.isInteger(period)||period<0)throw Error('Invalid CGRID settings');
-  await this.command(`CGRID ${t0} ${period}`);
-  const r=await this.line('',48);
-  if(r!=='OK')throw Error(r.startsWith('ERR ')?r:'Invalid CGRID acknowledgement');
- });}
- // Read-only: last continuous run's counters (duty etc.) and the device clock (us since boot).
- // Both are lenient (null on an unexpected reply) so a non-ESPsoup partner never throws here.
- async cstat(){return this.run(async()=>{
-  if(!this.hasCont||!this.writer)return null;
-  await this.command('CSTAT?');
-  const line=await this.line('CSTAT ',256);
-  // "CSTAT blocks <n> words <n> ... duty <f> ...": space-separated key value pairs.
-  const t=line.slice(6).split(' ');
-  if(!t.length||t.length%2!==0)return null;
-  const o={};for(let i=0;i<t.length;i+=2){const v=Number(t[i+1]);if(!Number.isFinite(v))return null;o[t[i]]=v;}
-  return o;
- });}
- async deviceTime(){return this.run(async()=>{
-  if(!this.writer||!this.hasFwopt)return null;
-  await this.command('TIME?');
-  const m=/^TIME (\d+)$/.exec(await this.line('',48));
-  return m?Number(m[1]):null;
- });}
- async capturePacket(c,divider){
-  let n=Math.max(c.fft,this.captureSamples??(this.maxBigSamples||this.maxSamples));
-  const damaged=message=>Object.assign(Error(message),{code:'CAPTURE_DAMAGED'});
-  for(let attempt=0;attempt<6;attempt++){
-   await this.command(`CAP${c.bits*2} ${n} ${divider}`);
-   try{
-    const header=await this.line();
-    if(header.startsWith('ERR '))throw Error(header);
-    const h=/^DATA (\d+) ([0-9a-fA-F]{1,8}) (\d+)$/.exec(header);
-    if(!h||Number(h[1])!==n)throw damaged('Invalid capture length or header');
-    // Detect a truncated transfer once data stops arriving, while allowing
-    // continuous transfers at slower baud rates up to the overall deadline.
-    const bytes=await this.read(Math.ceil(n*c.bits*2/8),performance.now()+5000,500);
-    if(crc32(bytes)!==parseInt(h[2],16))throw damaged('Capture CRC mismatch');
-    this.captureSamples=n;
-    return {bytes,n,captureUs:Number(h[3]),retries:attempt};
-   }catch(e){
-    if(this.failed||!['SERIAL_TIMEOUT','CAPTURE_DAMAGED'].includes(e.code))throw e;
-    this.droppedCaptures++;this.onCaptureError?.();
-    // A fresh echoed marker drains late payload bytes and restores framing.
-    // Do this even after the final failure so Resume starts from a boundary.
-    try{await this.synchronize();}catch(syncError){throw Error(`${e.message}; resynchronization failed: ${syncError.message}`,{cause:syncError});}
-    n=Math.max(c.fft,2**Math.ceil(Math.log2(n/2)));
-    this.captureSamples=n;
-    if(attempt===5)throw Error(`Capture failed after 6 attempts: ${e.message}. Check the serial connection.`);
-   }
+  async synchronize() {
+    // Opening a UART bridge or native serial port can reset the board. A command
+    // sent during boot is lost, so retry with a fresh marker after draining logs.
+    // A USB-JTAG port can also stop sending after the chip was reset through its
+    // UART pins (seen on the S31 and C61); a chip reset over USB recovers it.
+    const info = this.port.getInfo?.() ?? {},
+      usbJtag = info.usbVendorId === 0x303a && info.usbProductId === 0x1001;
+    for (let attempt = 0; attempt < (usbJtag ? 4 : 3); attempt++) {
+      // Opening a USB-JTAG port doesn't reset the chip, so a healthy one answers at once.
+      if (usbJtag && attempt === 1) await this.resetUsbJtag();
+      const marker = 'SYNC ' + Date.now(),
+        deadline = performance.now() + 2000;
+      await this.command('\n' + marker);
+      let window = '';
+      try {
+        for (let j = 0; j < 70000; j++) {
+          window += String.fromCharCode((await this.read(1, deadline))[0]);
+          if (window.length > marker.length + 1) window = window.slice(-marker.length - 1);
+          if (window === marker + '\n') return;
+        }
+      } catch (e) {
+        if (this.failed) throw e;
+      }
+    }
+    throw Error(
+      'SDR synchronization failed. Unplug your ESP32 device and plug it back in, then try connecting again. Check the UART baud setting, install ESP-SDR firmware, and close other SDR clients.',
+    );
   }
- }
- async capture(c){return this.run(async()=>{const divider=[80000000,40000000,20000000,10000000,8000000,4000000,16000000,32000000,10666667,6400000].indexOf(c.rate);const fftOk=[512,1024,2048,4096].includes(c.fft)||(this.hasBigcap&&(c.fft===8192||c.fft===16384));if(divider<0||!this.rxRates.includes(c.rate)||!this.sampleBits.includes(c.bits)||!fftOk)throw Error('Invalid capture settings');const start=performance.now();await this.tune(c.frequency,c.bandwidth??0);const gain=await this.setGain(c.gainMode,c.gain);const {bytes,n,captureUs,retries}=await this.capturePacket(c,divider);const iq=new Float32Array(n*2);let acc=0,bits=0,k=0;for(let j=0;j<n;j++){let i,q;if(c.bits===8){i=bytes[j*2];q=bytes[j*2+1];if(i>=128)i-=256;if(q>=128)q-=256;i*=4;q*=4;}else{while(bits<20){acc|=bytes[k++]<<bits;bits+=8;}const w=acc&0xfffff;acc>>>=20;bits-=20;i=w&1023;q=w>>>10;if(i>=512)i-=1024;if(q>=512)q-=1024;}iq[2*j]=i/512;iq[2*j+1]=-q/512;}
- const ps=spectrum(iq,c.fft);let peak=0;for(let j=1;j<ps.length;j++)if(ps[j]>ps[peak])peak=j;const elapsed=performance.now()-start;this.last={iq,frequency:c.frequency,rate:c.rate,bandwidth:c.bandwidth??0,bits:c.bits,time:Date.now()};return {...c,gain_actual:gain,sequence:++this.sequence,spectrum:ps,peak_hz:c.frequency*1e6+(peak-c.fft/2)*c.rate/c.fft,peak_db:ps[peak],capture_us:captureUs,samples:n,retries,dropped_captures:this.droppedCaptures,elapsed_ms:elapsed,delivered_ksps:n/elapsed,crc_ok:true,iq};});}
+  // The USB-JTAG peripheral resets the chip when DTR falls while RTS is high
+  // (as it is after opening the port); the USB connection stays up.
+  async resetUsbJtag() {
+    await this.port.setSignals({ dataTerminalReady: false }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  async startUartFirmware() {
+    // USB/UART bridges wire DTR to GPIO0 and RTS to EN. A previous flasher or
+    // port-open transition can leave the ESP32 in reset or the ROM downloader.
+    // Native USB ports must not receive this external-UART reset sequence.
+    const { usbVendorId: vendor, usbProductId: product } = this.port.getInfo?.() ?? {};
+    if (vendor === 0x303a && product === 0x0002) {
+      // ESP32-S2 native USB: the firmware stays silent while DTR is high, and
+      // a falling RTS reboots it, into the ROM bootloader if DTR is still high.
+      // Lowering DTR first gives a clean reboot, and with both lines low,
+      // closing the port later cannot send it to the bootloader.
+      await this.port.setSignals({ dataTerminalReady: false });
+      await this.port.setSignals({ requestToSend: false });
+      // The firmware restarts 50 ms later; don't synchronize with the old run.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return;
+    }
+    if (![0x10c4, 0x1a86, 0x0403, 0x067b].includes(vendor)) return;
+    await this.port.setSignals({ dataTerminalReady: false, requestToSend: true });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } finally {
+      await this.port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    }
+  }
+  async openPort(port, baudRate) {
+    this.port = port;
+    await port.open({ baudRate, bufferSize: 131072, flowControl: 'none' });
+    this.baudRate = baudRate;
+    this.reader = port.readable.getReader();
+    this.writer = port.writable.getWriter();
+    this.queue = [];
+    this.queued = 0;
+    this.failed = null;
+    this.pumping = this.pump();
+  }
+  async closePort() {
+    if (this.reader) {
+      await this.reader.cancel().catch(() => {});
+      await this.pumping;
+      this.reader.releaseLock();
+      this.reader = null;
+    }
+    if (this.writer) {
+      this.writer.releaseLock();
+      this.writer = null;
+    }
+    if (this.port) {
+      await this.port.close().catch(() => {});
+      this.port = null;
+    }
+    this.frequency = null;
+    this.filter = null;
+    this.analogFilter = null;
+    this.bandwidth = null;
+    this.gainSetting = null;
+    this.last = null;
+  }
+  async connectPort(port, baudRate, reset = true) {
+    // Only an initial connection resets the board. A baud switch must preserve
+    // the running firmware and its volatile UART rate.
+    const rates =
+      port.getInfo?.().usbVendorId === 0x303a ? [baudRate] : [...new Set([baudRate, 2000000, 1000000])];
+    let failure;
+    for (const rate of rates) {
+      try {
+        await this.openPort(port, rate);
+        if (reset) await this.startUartFirmware();
+        else {
+          // Release EN (RTS) before GPIO0 (DTR): sequential signal updates in
+          // the opposite order can reset the board and lose its runtime baud.
+          await port.setSignals({ requestToSend: false });
+          await port.setSignals({ dataTerminalReady: false });
+        }
+        await this.synchronize();
+        return;
+      } catch (e) {
+        failure = e;
+        await this.closePort();
+      }
+    }
+    throw failure;
+  }
+  async connect({ baudRate = 2000000, port = null } = {}) {
+    if (!port && !SerialConnection.supported())
+      throw Error('WebSerial or WebUSB support is required in this browser.');
+    if (!isSecureContext) throw Error('Serve this page over HTTPS or localhost.');
+    if (!port) port = await SerialConnection.requestPort();
+    return this.run(async () => {
+      await this.close();
+      try {
+        await this.connectPort(port, baudRate);
+        return await this.negotiate();
+      } catch (e) {
+        await this.close();
+        throw e;
+      }
+    });
+  }
+  async negotiateSpectrum(caps) {
+    this.specCapabilities = null;
+    if (!this.hasSpec) return;
+    if (caps.split(' ').includes('SPECCAPS')) {
+      await this.command('SPECINFO?');
+      this.applySpectrumCapabilities(await this.line('SPECINFO ', 4096));
+    } else if (this.family === 'S3') {
+      // Compatibility with the original S3 contribution.
+      const profiles = [
+        [16000000, 6, 256, 4, 1],
+        [40000000, 1, 256, 12, 3],
+        [80000000, 0, 256, 48, 5],
+      ];
+      if (this.hasSpecN)
+        profiles.push(
+          [16000000, 6, 1024, 8, 4],
+          [16000000, 6, 2048, 6, 8],
+          [40000000, 1, 1024, 18, 10],
+          [40000000, 1, 2048, 10, 20],
+        );
+      this.specCapabilities = { continuous: true, transports: ['USB'], profiles };
+    }
+  }
+  applySpectrumCapabilities(line) {
+    let c;
+    try {
+      c = JSON.parse(line.slice(9));
+    } catch {
+      throw Error('Invalid spectrum capabilities');
+    }
+    if (
+      typeof c?.continuous !== 'boolean' ||
+      !Array.isArray(c.transports) ||
+      !c.transports.length ||
+      c.transports.some((t) => !['USB', 'UART'].includes(t)) ||
+      !Array.isArray(c.profiles) ||
+      !c.profiles.length ||
+      c.profiles.length > 64 ||
+      c.profiles.some(
+        (p) =>
+          !Array.isArray(p) ||
+          (p.length !== 5 && p.length !== 6) ||
+          p.some((v) => !Number.isInteger(v)) ||
+          !this.rxRates.includes(p[0]) ||
+          p[1] < 0 ||
+          p[1] > 9 ||
+          ![256, 512, 1024, 2048].includes(p[2]) ||
+          p[3] < 1 ||
+          p[3] > 64 ||
+          p[4] < 1 ||
+          p[4] > 1000 ||
+          (p.length === 6 && p[5] !== 0 && p[5] !== 1),
+      )
+    )
+      throw Error('Invalid spectrum capabilities');
+    this.specCapabilities = c;
+  }
+  get canStreamSpectrum() {
+    return this.hasSpec && !!this.specCapabilities?.transports.includes(this.transport);
+  }
+  spectrumContinuous(rate, n) {
+    const p = this.spectrumProfiles(rate).find((p) => p[2] === n);
+    return p?.length === 6 ? !!p[5] : !!this.specCapabilities?.continuous;
+  }
+  spectrumProfiles(rate) {
+    return this.specCapabilities?.profiles.filter((p) => p[0] === rate) || [];
+  }
+  async negotiate() {
+    await this.command('INFO');
+    this.identity = await this.line();
+    this.applyIdentity(this.identity);
+    await this.command('CAPS');
+    const caps = await this.line('', 1024);
+    const has = (flag) => caps.split(' ').includes(flag);
 
+    await this.negotiateTransport(has('UARTBAUD'));
+    if (this.family === 'S3')
+      this.rxRates = [80000000, ...(has('RX40') ? [40000000] : []), ...(has('RX16') ? [16000000] : [])];
+    this.hasSerialLease = has('SERIALLEASE') || has('DUALSERIAL');
+    this.hasExtendedTune = has('TUNEEXT');
+    this.tuneRange = this.hasExtendedTune ? await this.negotiateTuneRange() : null;
+    this.hasAnalogFilter = has('LPFANA');
+    this.hasAnalogBandwidth = this.family !== 'S3' && has('ALPF');
+    this.hasFilter12 = this.family !== 'S3' && has('LPF12');
+    this.hasFilter = has('LPF') || this.hasAnalogFilter;
+    this.hasGain = has('GAIN');
+    this.hasSpec = has('SPEC');
+    this.hasSpecN = has('SPECN');
+    this.hasSpecStats = has('SPECSTAT');
+    this.hasHardwareAgc = has('HWAGC');
+    this.hasBigcap = has('BIGCAP');
+    this.hasFreqk = has('FREQK');
+    this.hasTemp = has('TEMP');
+    this.hasFwopt = has('FWOPT');
+    this.hasSweep = has('SWEEP');
+    this.hasCspec = has('CSPEC');
+    this.hasCgrid = has('CGRID');
+    this.hasCont = has('CONT');
+    this.hasGfsk = has('GFSKPKT');
+    await this.negotiateLimits(has('RXLIMITS'));
+    await this.negotiateVersion(caps);
+    await this.negotiateFwopt();
+    await this.negotiateGpio(caps);
+    await this.negotiateSpectrum(caps);
+    this.deviceName = this.family === 'ESP32' ? 'ESP32' : 'ESP32-' + this.family;
+    return { identity: this.identity, port: this.deviceName, family: this.family, filter: this.hasFilter };
+  }
+  // Firmware with UARTBAUD reports which interface we are on, and the UART's baud rate.
+  async negotiateTransport(supported) {
+    this.supportsBaudChange = false;
+    this.transport = null;
+    if (!supported) return;
+    await this.command('TRANSPORT?');
+    const t = /^TRANSPORT (UART|USB) (\d+)$/.exec(await this.line());
+    if (!t || (t[1] === 'UART' ? Number(t[2]) !== this.baudRate : Number(t[2]) !== 0))
+      throw Error('Invalid serial transport response');
+    this.transport = t[1];
+    this.supportsBaudChange = this.transport === 'UART';
+  }
+  // "RANGE <lowest MHz> <highest MHz> 1": the frequencies FREQ will attempt.
+  async negotiateTuneRange() {
+    await this.command('RANGE?');
+    const h = (await this.line('RANGE ')).split(' ');
+    const lo = Number(h[1]),
+      hi = Number(h[2]);
+    const valid =
+      h.length === 4 && Number.isInteger(lo) && Number.isInteger(hi) && lo >= 100 && hi <= 6000 && lo < hi;
+    if (!valid || h[3] !== '1') throw Error('Invalid tuning range');
+    return [lo, hi];
+  }
+  // Newer firmware sends all receiver limits at once; older firmware only its gain range.
+  async negotiateLimits(supported) {
+    if (supported) {
+      await this.command('LIMITS?');
+      this.applyLimits(await this.line('LIMITS ', 4096));
+      return;
+    }
+    await this.command('GAIN?');
+    const g = (await this.line('GAIN ')).split(' ');
+    const limits = {
+      gain: [Number(g[3]), Number(g[4]), 1],
+      bandwidth: null,
+      rates: this.rxRates,
+      bits: [8, 10],
+    };
+    this.applyLimits('LIMITS ' + JSON.stringify(limits));
+  }
+
+  async negotiateVersion(caps) {
+    this.firmwareVersion = { status: 'missing' };
+    if (!caps.split(' ').includes('VERSION')) return;
+    await this.command('VERSION?');
+    const line = await this.line('', 512);
+    if (line === 'ERR command') return;
+    this.firmwareVersion = { status: 'unknown' };
+    try {
+      if (!line.startsWith('VERSION ')) return;
+      const value = JSON.parse(line.slice(8)),
+        profile = this.family === 'ESP32' ? 'esp32' : 'esp32' + this.family.toLowerCase();
+      if (
+        value.profile !== profile ||
+        typeof value.revision !== 'string' ||
+        !/^(?:[a-f0-9]{7,40}(?:-dirty)?|unknown)$/.test(value.revision) ||
+        firmwareDateValue(value.build_timestamp) === null ||
+        value.build_timestamp.length !== 20 ||
+        value.build_date !== value.build_timestamp.slice(0, 10)
+      )
+        return;
+      this.firmwareVersion = { ...value, status: 'known' };
+    } catch {
+      /* Malformed optional metadata must not prevent reception. */
+    }
+  }
+  async negotiateFwopt() {
+    this.fwopt = null;
+    if (!this.hasFwopt) return;
+    await this.command('FWOPT?');
+    const line = await this.line('', 128);
+    if (!line.startsWith('FWOPT ')) return;
+    this.fwopt = line.slice(6).trim();
+    // ESPsoup reports its build through FWOPT, not the VERSION JSON. Treat that as a
+    // known identity so the update banner never tells the user to "update" newer firmware.
+    if (this.firmwareVersion?.status === 'missing')
+      this.firmwareVersion = { status: 'espsoup', fwopt: this.fwopt };
+  }
+  async negotiateGpio(caps) {
+    this.hasGpio = caps.split(' ').includes('GPIO');
+    this.gpioPins = [];
+    if (!this.hasGpio) return;
+    await this.command('GPIO?');
+    const line = await this.line('', 512);
+    if (!/^GPIO(?: (?:0|[1-9][0-9]?):[Z01])*$/.test(line)) throw Error('Invalid GPIO response');
+    const pins = line.slice(4).trim();
+    this.gpioPins = pins
+      ? pins.split(' ').map((entry) => {
+          const [pin, state] = entry.split(':');
+          return { pin: Number(pin), state };
+        })
+      : [];
+    if (this.gpioPins.some((p, i) => p.pin > 63 || (i && p.pin <= this.gpioPins[i - 1].pin))) {
+      this.gpioPins = [];
+      throw Error('Invalid GPIO pin list');
+    }
+  }
+  async setGpio(pin, state) {
+    return this.run(async () => {
+      const entry = this.gpioPins.find((p) => p.pin === pin);
+      if (!this.hasGpio || !entry || !['Z', '0', '1'].includes(state)) throw Error('Invalid GPIO setting');
+      await this.command(`GPIO ${pin} ${state}`);
+      const response = await this.line();
+      if (response !== `OK GPIO ${pin} ${state}`)
+        throw Error(response.startsWith('ERR ') ? response : 'Invalid GPIO acknowledgement');
+      entry.state = state;
+    });
+  }
+  async setBaudRate(baudRate) {
+    return this.run(async () => {
+      this.changingBaud = true;
+      try {
+        if (!this.port || !this.supportsBaudChange || this.transport !== 'UART')
+          throw Error('Update ESP-SDR firmware to enable UART baud changes.');
+        if (![1000000, 2000000].includes(baudRate)) throw Error('Choose 1 or 2 MBaud.');
+        if (baudRate === this.baudRate) return;
+        const port = this.port;
+        await this.synchronize();
+        await this.command(`BAUD ${baudRate}`);
+        let acknowledgement;
+        try {
+          acknowledgement = await this.line();
+        } catch (e) {
+          // The ACK can itself lose bytes. Probe the port at both rates below.
+          if (e.code !== 'SERIAL_TIMEOUT' && e.code !== 'CAPTURE_DAMAGED') throw e;
+        }
+        if (acknowledgement?.startsWith('ERR ')) throw Error(acknowledgement);
+        // Do not send LPF/RELEASE here: the device may already use the new baud.
+        await this.closePort();
+        try {
+          await this.connectPort(port, baudRate, false);
+          await this.negotiate();
+        } catch (e) {
+          await this.close();
+          throw e;
+        }
+        if (this.transport !== 'UART' || this.baudRate !== baudRate)
+          throw Error(
+            'The device did not retain the requested baud rate; it may have reset during port reopen. The default connection was recovered.',
+          );
+      } catch (e) {
+        if (this.failed) await this.close();
+        throw e;
+      } finally {
+        this.changingBaud = false;
+      }
+    });
+  }
+  applyIdentity(identity) {
+    const m = /^(ESP32|C2|C3|C5|C6|C61|H2|S2|S3|S31)SDR 6 burst (\d+)$/.exec(identity);
+    const n = m ? Number(m[2]) : 0;
+    if (!m || !Number.isInteger(n) || n < 4096 || n > 16384)
+      throw Error('Unsupported SDR firmware: ' + identity);
+    this.family = m[1];
+    this.maxSamples = n;
+    this.captureSamples = null;
+    this.droppedCaptures = 0;
+    this.spectrumCrcErrors = 0;
+    this.rxRates =
+      this.family === 'H2'
+        ? [32000000, 16000000, 10666667, 6400000]
+        : this.family === 'ESP32'
+          ? [80000000, 40000000, 16000000]
+          : this.family === 'S31'
+            ? [16000000, 8000000, 4000000]
+            : this.family === 'C2' ||
+                this.family === 'C3' ||
+                this.family === 'S3' ||
+                this.family === 'S2' ||
+                this.family === 'C6'
+              ? [80000000]
+              : [80000000, 40000000, 20000000, 10000000, 8000000, 4000000];
+  }
+  applyLimits(line) {
+    let limits;
+    try {
+      limits = JSON.parse(line.slice(7));
+    } catch {
+      throw Error('Invalid receiver limits');
+    }
+    const range = (r, max) =>
+      Array.isArray(r) &&
+      r.length === 3 &&
+      r.every(Number.isInteger) &&
+      r[0] >= 0 &&
+      r[1] >= r[0] &&
+      r[1] <= max &&
+      r[2] > 0 &&
+      r[2] <= Math.max(1, r[1] - r[0]) &&
+      (r[1] - r[0]) % r[2] === 0;
+    const g = limits?.gain,
+      b = limits?.bandwidth,
+      rates = limits?.rates,
+      bits = limits?.bits;
+    if (
+      !line.startsWith('LIMITS ') ||
+      !range(g, 127) ||
+      !(
+        b === null ||
+        (Array.isArray(b) &&
+          b.length === 4 &&
+          range(b.slice(0, 3), 1000) &&
+          b[0] > 0 &&
+          Number.isInteger(b[3]) &&
+          (b[3] === 0 || (b[3] >= b[0] && b[3] <= b[1] && (b[3] - b[0]) % b[2] === 0)))
+      ) ||
+      !Array.isArray(rates) ||
+      !rates.length ||
+      rates.some((r) => !RATE_CODES.includes(r)) ||
+      new Set(rates).size !== rates.length ||
+      !Array.isArray(bits) ||
+      !bits.length ||
+      bits.some((b) => ![8, 10].includes(b)) ||
+      new Set(bits).size !== bits.length
+    )
+      throw Error('Invalid receiver limits');
+    [this.gainMin, this.gainMax, this.gainStep] = g;
+    this.bandwidthRange = b;
+    this.rxRates = rates;
+    this.sampleBits = bits;
+    // Optional ESPsoup extensions: ignored silently when absent or malformed.
+    const ms = limits.maxSamples;
+    this.maxBigSamples = Number.isInteger(ms) && ms > this.maxSamples && ms <= 262144 ? ms : null;
+    const fs = limits.freqStepHz;
+    this.freqStepHz = Number.isInteger(fs) && fs > 0 && fs <= 1000000 && 1000000 % fs === 0 ? fs : null;
+    const lm = limits.lockMHz;
+    this.lockRanges =
+      Array.isArray(lm) &&
+      lm.length &&
+      lm.every(
+        (r) =>
+          Array.isArray(r) &&
+          r.length === 2 &&
+          Number.isInteger(r[0]) &&
+          Number.isInteger(r[1]) &&
+          r[0] < r[1],
+      )
+        ? lm
+        : null;
+  }
+  async close() {
+    if (this.writer && this.reader && !this.failed && this.hasFilter) {
+      try {
+        await this.command('LPF AUTO');
+        await this.line('OK');
+      } catch (e) {
+        /* Disconnect still releases USB after a lost response. */
+      }
+    }
+    if (this.writer && this.reader && !this.failed && this.hasAnalogBandwidth) {
+      try {
+        await this.command('ALPF AUTO');
+        await this.line('OK');
+      } catch (e) {}
+    }
+    if (this.hasSerialLease && this.writer && this.reader && !this.failed) {
+      try {
+        await this.command('RELEASE');
+        await this.line('OK');
+      } catch (e) {
+        /* Idle ownership expires if the port disappears. */
+      }
+    }
+    this.firmwareVersion = null;
+    this.hasGpio = false;
+    this.gpioPins = [];
+    this.hasSerialLease = false;
+    this.hasExtendedTune = false;
+    this.tuneRange = null;
+    this.hasBigcap = false;
+    this.hasFreqk = false;
+    this.hasTemp = false;
+    this.hasFwopt = false;
+    this.hasSweep = false;
+    this.hasCspec = false;
+    this.hasCgrid = false;
+    this.hasCont = false;
+    this.hasGfsk = false;
+    this.fwopt = null;
+    this.maxBigSamples = null;
+    this.freqStepHz = null;
+    this.lockRanges = null;
+    await this.closePort();
+    this.transport = null;
+    this.supportsBaudChange = false;
+  }
+  validFrequency(f) {
+    if (typeof f !== 'number' || !Number.isFinite(f)) return false;
+    // With FREQK the grid is 1 kHz; otherwise whole MHz (same as the historical integer check).
+    const stepHz = this.hasFreqk && this.freqStepHz ? this.freqStepHz : 1000000;
+    if (Math.abs(Math.round((f * 1000000) / stepHz) * stepHz - f * 1000000) > 0.5) return false;
+    if (this.hasExtendedTune) return !!this.tuneRange && f >= this.tuneRange[0] && f <= this.tuneRange[1];
+    // Only firmware without TUNEEXT needs the historical family defaults.
+    if (this.family === 'ESP32') return f >= 2412 && f <= 2472 && (f - 2412) % 5 === 0;
+    if (this.family === 'S31') return f >= 2300 && f <= 2800;
+    if (this.family === 'C61') return f >= 2400 && f <= 2500;
+    if (this.family === 'C5') return (f >= 2100 && f <= 2700) || (f >= 4800 && f <= 6000);
+    return (f >= 2412 && f <= 2472 && (f - 2412) % 5 === 0) || f === 2484;
+  }
+  frequencyWarning(f) {
+    if (
+      !this.validFrequency(f) ||
+      (f >= 2400 && f <= 2483.5) ||
+      (this.family === 'C5' && f >= 5150 && f <= 5895)
+    )
+      return '';
+    const band =
+      this.family === 'C5'
+        ? 'Outside the 2.4 GHz ISM band and the supported 5 GHz Wi-Fi band.'
+        : 'Outside the 2.4 GHz ISM band.';
+    const measured = MEASURED_RANGES[this.family];
+    const tested = measured && !measured.some(([lo, hi]) => f >= lo && f <= hi);
+    const chip = this.family === 'ESP32' ? 'ESP32' : 'ESP32-' + this.family;
+    const ranges = measured?.map(([lo, hi]) => `${lo}–${hi} MHz`).join(' and ');
+    return tested
+      ? `${band} On our test board, the ${chip} received a test tone at ${ranges}, which does not include this frequency.`
+      : `${band} The PLL may not lock, and the spectrum may not match the selected center frequency.`;
+  }
+  nearestFrequency(f) {
+    const stepHz = this.hasFreqk && this.freqStepHz ? this.freqStepHz : 1000000;
+    f = (Math.round((f * 1000000) / stepHz) * stepHz) / 1000000;
+    if (this.hasExtendedTune && this.tuneRange)
+      return Math.max(this.tuneRange[0], Math.min(this.tuneRange[1], f));
+    // Compatibility with firmware predating range negotiation.
+    if (this.family === 'C61') return Math.max(2400, Math.min(2500, f));
+    if (this.family === 'S31') return Math.max(2300, Math.min(2800, f));
+    if (this.family === 'C5') {
+      const ranges = [
+        [2100, 2700],
+        [4800, 6000],
+      ];
+      return ranges
+        .map(([lo, hi]) => Math.max(lo, Math.min(hi, f)))
+        .reduce((a, b) => (Math.abs(a - f) <= Math.abs(b - f) ? a : b));
+    }
+    const channels = Array.from({ length: 13 }, (_, i) => 2412 + i * 5);
+    if (this.family !== 'ESP32') channels.push(2484);
+    return channels.reduce((a, b) => (Math.abs(a - f) <= Math.abs(b - f) ? a : b));
+  }
+  frequencyInput() {
+    const step = this.hasFreqk && this.freqStepHz ? this.freqStepHz / 1000000 : 1;
+    if (this.hasExtendedTune && this.tuneRange)
+      return { min: this.tuneRange[0], max: this.tuneRange[1], step };
+    if (this.family === 'ESP32') return { min: 2412, max: 2472, step: 5 };
+    if (this.family === 'C61') return { min: 2400, max: 2500, step: 1 };
+    if (this.family === 'S31') return { min: 2300, max: 2800, step: 1 };
+    return this.family === 'C5' ? { min: 2100, max: 6000, step } : { min: 2412, max: 2484, step: 1 };
+  }
+  async tune(frequency, bandwidth = 0) {
+    if (!this.validFrequency(frequency))
+      throw Error(
+        this.hasExtendedTune
+          ? this.hasFreqk && this.freqStepHz
+            ? `Choose a center frequency from ${this.tuneRange[0]} to ${this.tuneRange[1]} MHz in ${this.freqStepHz < 1000 ? this.freqStepHz + ' Hz' : this.freqStepHz / 1000 + ' kHz'} steps.`
+            : `Choose a whole-MHz center frequency from ${this.tuneRange[0]} to ${this.tuneRange[1]} MHz.`
+          : this.family === 'ESP32'
+            ? 'Choose a Wi-Fi channel center from 2412 to 2472 MHz in 5 MHz steps.'
+            : 'This firmware cannot attempt that center frequency. Install updated firmware for extended tuning.',
+      );
+    if (!this.port) throw Error('Connect the SDR first.');
+    const range = this.bandwidthRange;
+    if (
+      !Number.isInteger(bandwidth) ||
+      bandwidth < 0 ||
+      (bandwidth !== 0 &&
+        (!range || bandwidth < range[0] || bandwidth > range[1] || (bandwidth - range[0]) % range[2] !== 0))
+    )
+      throw Error(
+        range
+          ? `Choose an analog bandwidth from ${range[0]} to ${range[1]} MHz.`
+          : 'Manual analog bandwidth is not characterized for this firmware.',
+      );
+    if (this.frequency !== frequency) {
+      this.frequency = null;
+      // FREQK tunes in 1 kHz steps for a fractional MHz; FREQ (whole MHz) also resets the kHz offset.
+      if (this.hasFreqk && !Number.isInteger(frequency))
+        await this.command('FREQK ' + Math.round(frequency * 1000));
+      else await this.command('FREQ ' + frequency);
+      await this.line('OK');
+      this.frequency = frequency;
+    }
+    if (range && this.bandwidth !== bandwidth) {
+      await this.command('BANDWIDTH ' + bandwidth);
+      await this.line('OK');
+      this.bandwidth = bandwidth;
+    }
+  }
+  async setGain(mode = 'HARDWARE', code = 40) {
+    if (
+      !['HARDWARE', 'MANUAL'].includes(mode) ||
+      !Number.isInteger(code) ||
+      code < this.gainMin ||
+      code > this.gainMax ||
+      (code - this.gainMin) % this.gainStep !== 0
+    )
+      throw Error(`Choose a gain index from ${this.gainMin} to ${this.gainMax}.`);
+    if (!this.hasGain) throw Error('Update SDR firmware for gain control.');
+    if (mode === 'HARDWARE' && !this.hasHardwareAgc) throw Error('Update SDR firmware for hardware AGC.');
+    const setting = mode === 'MANUAL' ? 'MANUAL ' + code : mode;
+    if (setting !== this.gainSetting) {
+      await this.command('GAIN ' + setting);
+      await this.line('OK');
+      this.gainSetting = setting;
+    }
+    await this.command('GAIN?');
+    const h = (await this.line('GAIN ')).split(' ');
+    if (!['HARDWARE', 'MANUAL'].includes(h[1]) || !Number.isInteger(Number(h[2])))
+      throw Error('Invalid gain response');
+    return { mode: h[1], index: h[1] === 'HARDWARE' ? null : Number(h[2]) };
+  }
+  async temperature() {
+    return this.run(async () => {
+      if (!this.hasTemp || !this.writer) return null;
+      await this.command('TEMP?');
+      const m = /^TEMP (-?\d+(?:\.\d+)?)$/.exec(await this.line('', 48));
+      return m ? Number(m[1]) : null;
+    });
+  }
+  // ESPsoup diagnostics snapshot for the debug panel. Only control-plane queries;
+  // callers must avoid it mid-stream (any host line stops SPEC/CSPEC/SWEEP).
+  async diagnostics() {
+    return this.run(async () => {
+      if (!this.writer || !this.hasFwopt) return null;
+      const out = { fwopt: this.fwopt };
+      const q = async (cmd) => {
+        await this.command(cmd);
+        return this.line('', 128);
+      };
+      try {
+        const m = /^TEMP (-?\d+(?:\.\d+)?)$/.exec(await q('TEMP?'));
+        if (m) out.temp = Number(m[1]);
+      } catch (e) {}
+      try {
+        const m = /^HEAP (\d+) (\d+)$/.exec(await q('HEAP?'));
+        if (m) {
+          out.heapFree = Number(m[1]);
+          out.heapLargest = Number(m[2]);
+        }
+      } catch (e) {}
+      try {
+        const m = /^TUNEM (\d+)$/.exec(await q('TUNEM?'));
+        if (m) out.tunem = Number(m[1]);
+      } catch (e) {}
+      try {
+        const m = /^ENGINE (\w+)$/.exec(await q('ENGINE?'));
+        if (m) out.engine = m[1];
+      } catch (e) {}
+      return out;
+    });
+  }
+  // ESPsoup continuous-engine time grid. CGRID anchors continuous block starts to a grid so
+  // two boards can cover each other's gaps; "CGRID 0 0" is free-running. Reply OK. Set it before
+  // cspec(). CADJ (phase steering) is valid only during a run, so it is issued from the cspec
+  // loop's steering hook, not as a standalone command (idle CADJ returns "ERR command").
+  async cgrid(t0, period) {
+    return this.run(async () => {
+      if (!this.hasCgrid) throw Error('Continuous grid control is unavailable on this firmware.');
+      if (!Number.isInteger(t0) || t0 < 0 || !Number.isInteger(period) || period < 0)
+        throw Error('Invalid CGRID settings');
+      await this.command(`CGRID ${t0} ${period}`);
+      const r = await this.line('', 48);
+      if (r !== 'OK') throw Error(r.startsWith('ERR ') ? r : 'Invalid CGRID acknowledgement');
+    });
+  }
+  // Read-only: last continuous run's counters (duty etc.) and the device clock (us since boot).
+  // Both are lenient (null on an unexpected reply) so a non-ESPsoup partner never throws here.
+  async cstat() {
+    return this.run(async () => {
+      if (!this.hasCont || !this.writer) return null;
+      await this.command('CSTAT?');
+      const line = await this.line('CSTAT ', 256);
+      // "CSTAT blocks <n> words <n> ... duty <f> ...": space-separated key value pairs.
+      const t = line.slice(6).split(' ');
+      if (!t.length || t.length % 2 !== 0) return null;
+      const o = {};
+      for (let i = 0; i < t.length; i += 2) {
+        const v = Number(t[i + 1]);
+        if (!Number.isFinite(v)) return null;
+        o[t[i]] = v;
+      }
+      return o;
+    });
+  }
+  async deviceTime() {
+    return this.run(async () => {
+      if (!this.writer || !this.hasFwopt) return null;
+      await this.command('TIME?');
+      const m = /^TIME (\d+)$/.exec(await this.line('', 48));
+      return m ? Number(m[1]) : null;
+    });
+  }
+  async capturePacket(c, divider) {
+    let n = Math.max(c.fft, this.captureSamples ?? (this.maxBigSamples || this.maxSamples));
+    const damaged = (message) => Object.assign(Error(message), { code: 'CAPTURE_DAMAGED' });
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await this.command(`CAP${c.bits * 2} ${n} ${divider}`);
+      try {
+        const header = await this.line();
+        if (header.startsWith('ERR ')) throw Error(header);
+        const h = /^DATA (\d+) ([0-9a-fA-F]{1,8}) (\d+)$/.exec(header);
+        if (!h || Number(h[1]) !== n) throw damaged('Invalid capture length or header');
+        // Detect a truncated transfer once data stops arriving, while allowing
+        // continuous transfers at slower baud rates up to the overall deadline.
+        const bytes = await this.read(Math.ceil((n * c.bits * 2) / 8), performance.now() + 5000, 500);
+        if (crc32(bytes) !== parseInt(h[2], 16)) throw damaged('Capture CRC mismatch');
+        this.captureSamples = n;
+        return { bytes, n, captureUs: Number(h[3]), retries: attempt };
+      } catch (e) {
+        if (this.failed || !['SERIAL_TIMEOUT', 'CAPTURE_DAMAGED'].includes(e.code)) throw e;
+        this.droppedCaptures++;
+        this.onCaptureError?.();
+        // A fresh echoed marker drains late payload bytes and restores framing.
+        // Do this even after the final failure so Resume starts from a boundary.
+        try {
+          await this.synchronize();
+        } catch (syncError) {
+          throw Error(`${e.message}; resynchronization failed: ${syncError.message}`, { cause: syncError });
+        }
+        n = Math.max(c.fft, 2 ** Math.ceil(Math.log2(n / 2)));
+        this.captureSamples = n;
+        if (attempt === 5)
+          throw Error(`Capture failed after 6 attempts: ${e.message}. Check the serial connection.`);
+      }
+    }
+  }
+  async capture(c) {
+    return this.run(async () => {
+      const divider = RATE_CODES.indexOf(c.rate);
+      const fftOk =
+        [512, 1024, 2048, 4096].includes(c.fft) || (this.hasBigcap && (c.fft === 8192 || c.fft === 16384));
+      if (divider < 0 || !this.rxRates.includes(c.rate) || !this.sampleBits.includes(c.bits) || !fftOk)
+        throw Error('Invalid capture settings');
+      const start = performance.now();
+      await this.tune(c.frequency, c.bandwidth ?? 0);
+      const gain = await this.setGain(c.gainMode, c.gain);
+      const { bytes, n, captureUs, retries } = await this.capturePacket(c, divider);
+      const iq = decodeIQ(bytes, n, c.bits);
+      const ps = spectrum(iq, c.fft);
+      const peak = argmax(ps);
+      const elapsed = performance.now() - start;
+      this.last = {
+        iq,
+        frequency: c.frequency,
+        rate: c.rate,
+        bandwidth: c.bandwidth ?? 0,
+        bits: c.bits,
+        time: Date.now(),
+      };
+      return {
+        ...c,
+        gain_actual: gain,
+        sequence: ++this.sequence,
+        spectrum: ps,
+        peak_hz: c.frequency * 1e6 + ((peak - c.fft / 2) * c.rate) / c.fft,
+        peak_db: ps[peak],
+        capture_us: captureUs,
+        samples: n,
+        retries,
+        dropped_captures: this.droppedCaptures,
+        elapsed_ms: elapsed,
+        delivered_ksps: n / elapsed,
+        crc_ok: true,
+        clipped: clippedFraction(iq, c.bits),
+        iq,
+      };
+    });
+  }
 }
-const radio=new BurstSerialRadio();
+const radio = new BurstSerialRadio();
 
 // Incremental decoder retains bytes after damaged/truncated frames so a stop
 // report is still recoverable, even when it follows a partially sent frame.
 class SpectrumDecoder {
- constructor(n){this.n=n;this.bytes=new Uint8Array();this.crcErrors=0;}
- feed(bytes){
-  const joined=new Uint8Array(this.bytes.length+bytes.length);
-  joined.set(this.bytes);joined.set(bytes,this.bytes.length);this.bytes=joined;
-  const events=[];let at=0;
-  while(this.bytes.length-at>=4){
-   const b=this.bytes.subarray(at);
-   if(b[0]!==83||b[1]!==80){at++;continue;}
-   if(b[2]===69&&b[3]===67){
-    if(b.length<8)break;
-    if(String.fromCharCode(...b.subarray(0,8))!=='SPECEND '){at++;continue;}
-    const end=b.indexOf(10);
-    if(end<0){if(b.length>256){at++;continue;}break;}
-    const report=String.fromCharCode(...b.subarray(0,end)).trim();
-    if(!/^SPECEND(?: \d+){12}$/.test(report)){at++;continue;}
-    events.push({report,status:Number(report.split(' ')[1])});at+=end+1;continue;
-   }
-   if(b[2]===83&&b[3]===49){ // SPS1: chip statistics (firmware with SPECSTAT)
-    if(b.length<40)break;
-    const dv=new DataView(b.buffer,b.byteOffset,40);
-    if(crc32(b.subarray(0,36))!==dv.getUint32(36,true)){this.crcErrors++;at++;continue;}
-    events.push({stats:{core0:dv.getUint16(4,true)/10,core1:dv.getUint16(6,true)/10,coverage:dv.getUint16(8,true)/10,
-     dual:!!(b[10]&1),assist:!!(b[10]&2),heapFree:dv.getUint32(12,true),heapLargest:dv.getUint32(16,true),abandoned:dv.getUint32(20,true),
-     drops:dv.getUint32(24,true),lateMax:dv.getUint16(28,true),queue:dv.getUint16(30,true)/10,fftsPerS:dv.getUint32(32,true),t:performance.now()}});
-    at+=40;continue;
-   }
-   if(b[2]!==67||b[3]!==49){at++;continue;}
-   const length=32+this.n;
-   if(b.length<length){
-    const text=String.fromCharCode(...b);
-    const stop=text.indexOf('SPECEND ');
-    if(stop>=0&&/^SPECEND(?: \d+){12}\n/.test(text.slice(stop))){this.crcErrors++;at+=stop;continue;}
-    break;
-   }
-   const dv=new DataView(b.buffer,b.byteOffset,length);
-   if(b[26]!==Math.log2(this.n)||b[27]!==2||crc32(b.subarray(0,length-4))!==dv.getUint32(length-4,true)){
-    this.crcErrors++;at++;continue;
-   }
-   const h={frame:dv.getUint32(4,true),pairIndex:Number(dv.getBigUint64(8,true)),pairs:dv.getUint32(16,true),
-    ffts:dv.getUint16(20,true),flags:b[22],gain:b[23],drops:dv.getUint16(24,true),step:b[27],n:this.n,bytes:length};
-   events.push({header:h,bins:b.slice(28,28+this.n)});at+=length;
+  constructor(n) {
+    this.n = n;
+    this.bytes = new Uint8Array();
+    this.crcErrors = 0;
   }
-  this.bytes=this.bytes.slice(at);
-  return events;
- }
+  feed(bytes) {
+    const joined = new Uint8Array(this.bytes.length + bytes.length);
+    joined.set(this.bytes);
+    joined.set(bytes, this.bytes.length);
+    this.bytes = joined;
+    const events = [];
+    let at = 0;
+    while (this.bytes.length - at >= 4) {
+      const b = this.bytes.subarray(at);
+      const tag = String.fromCharCode(b[0], b[1], b[2], b[3]);
+      const parser = { SPEC: 'parseEnd', SPS1: 'parseStats', SPC1: 'parseFrame' }[tag];
+      // Each parser returns null to wait for more bytes, or how many bytes it used.
+      const result = parser ? this[parser](b) : { used: 1 };
+      if (!result) break;
+      if (result.event) events.push(result.event);
+      at += result.used;
+    }
+    this.bytes = this.bytes.slice(at);
+    return events;
+  }
+
+  // "SPECEND <12 numbers>\n" ends a stream.
+  parseEnd(b) {
+    if (b.length < 8) return null;
+    if (String.fromCharCode(...b.subarray(0, 8)) !== 'SPECEND ') return { used: 1 };
+    const end = b.indexOf(10);
+    if (end < 0) return b.length > 256 ? { used: 1 } : null;
+    const report = String.fromCharCode(...b.subarray(0, end)).trim();
+    if (!/^SPECEND(?: \d+){12}$/.test(report)) return { used: 1 };
+    return { used: end + 1, event: { report, status: Number(report.split(' ')[1]) } };
+  }
+
+  // SPS1: 40-byte chip statistics (firmware with SPECSTAT).
+  parseStats(b) {
+    if (b.length < 40) return null;
+    const dv = new DataView(b.buffer, b.byteOffset, 40);
+    if (crc32(b.subarray(0, 36)) !== dv.getUint32(36, true)) {
+      this.crcErrors++;
+      return { used: 1 };
+    }
+    const stats = {
+      core0: dv.getUint16(4, true) / 10,
+      core1: dv.getUint16(6, true) / 10,
+      coverage: dv.getUint16(8, true) / 10,
+      dual: !!(b[10] & 1),
+      assist: !!(b[10] & 2),
+      heapFree: dv.getUint32(12, true),
+      heapLargest: dv.getUint32(16, true),
+      abandoned: dv.getUint32(20, true),
+      drops: dv.getUint32(24, true),
+      lateMax: dv.getUint16(28, true),
+      queue: dv.getUint16(30, true) / 10,
+      fftsPerS: dv.getUint32(32, true),
+      t: performance.now(),
+    };
+    return { used: 40, event: { stats } };
+  }
+
+  // SPC1: 28-byte header, n spectrum bins, CRC32.
+  parseFrame(b) {
+    const length = 32 + this.n;
+    if (b.length < length) {
+      // A stop report inside a frame means the frame was cut short.
+      const text = String.fromCharCode(...b);
+      const stop = text.indexOf('SPECEND ');
+      if (stop >= 0 && /^SPECEND(?: \d+){12}\n/.test(text.slice(stop))) {
+        this.crcErrors++;
+        return { used: stop };
+      }
+      return null;
+    }
+    const dv = new DataView(b.buffer, b.byteOffset, length);
+    if (
+      b[26] !== Math.log2(this.n) ||
+      b[27] !== 2 ||
+      crc32(b.subarray(0, length - 4)) !== dv.getUint32(length - 4, true)
+    ) {
+      this.crcErrors++;
+      return { used: 1 };
+    }
+    const header = {
+      frame: dv.getUint32(4, true),
+      pairIndex: Number(dv.getBigUint64(8, true)),
+      pairs: dv.getUint32(16, true),
+      ffts: dv.getUint16(20, true),
+      flags: b[22],
+      gain: b[23],
+      drops: dv.getUint16(24, true),
+      step: b[27],
+      n: this.n,
+      bytes: length,
+    };
+    return { used: length, event: { header, bins: b.slice(28, 28 + this.n) } };
+  }
 }
 
-BurstSerialRadio.prototype.spec=function(c,onFrame,shouldStop){return this.run(async()=>{
- if(!this.canStreamSpectrum)throw Error('Spectrum streaming is unavailable on this connection.');
- const profile=this.spectrumProfiles(c.rate).find(p=>p[2]===c.fft);
- if(!profile)throw Error('Unsupported spectrum settings');
- await this.tune(c.frequency,c.bandwidth??0);
- const gain=await this.setGain(c.gainMode,c.gain),n=c.fft;
- const decoder=new SpectrumDecoder(n);
- let ended=false,stopping=false,count=0;
- this.lossy=true;this.hostDropped=0;
- try{
-  // c.upf may merge more units per frame than the profile (tied to the waterfall row time)
-  const upf=Math.min(1000,Math.max(profile[4],c.upf||0));
-  await this.command(`SPEC 0 ${profile[3]} ${upf} ${c.maxHold===false?0:1} ${profile[1]}${this.hasSpecN?' '+n:''}${this.hasSpecN&&this.hasSpecStats?' 1':''}`);
-  const head=(await this.line('SPEC ')).split(' ');
-  const info={nfft:Number(head[1]),fs:Number(head[2]),lo:Number(head[4])*1e6,gain,crcErrors:0};
-  if(head.length!==5||info.nfft!==n||info.fs!==c.rate||info.lo!==c.frequency*1e6)throw Error('Unexpected spectrum header');
-  for(;;){
-   if((++count&15)===0)await yieldTask();
-   if(!stopping&&shouldStop()){stopping=true;await this.command('');}
-   const events=decoder.feed(await this.read(Math.max(1,Math.min(this.queued,8192)),performance.now()+5000));
-   // Report corruption even when no valid spectrum survives this read.
-   const crcErrors=decoder.crcErrors-info.crcErrors;
-   info.crcErrors=decoder.crcErrors;info.hostDropped=this.hostDropped;
-   if(crcErrors){this.spectrumCrcErrors+=crcErrors;this.onCaptureError?.();}
-   for(const event of events){
-    if(event.report){
-     ended=true;info.report=event.report;
-     if(event.status)throw Error(`Spectrum capture stopped: ${event.report}`);
-     return info;
+BurstSerialRadio.prototype.spec = function (c, onFrame, shouldStop) {
+  return this.run(async () => {
+    if (!this.canStreamSpectrum) throw Error('Spectrum streaming is unavailable on this connection.');
+    const profile = this.spectrumProfiles(c.rate).find((p) => p[2] === c.fft);
+    if (!profile) throw Error('Unsupported spectrum settings');
+    await this.tune(c.frequency, c.bandwidth ?? 0);
+    const gain = await this.setGain(c.gainMode, c.gain),
+      n = c.fft;
+    const decoder = new SpectrumDecoder(n);
+    let ended = false,
+      stopping = false,
+      count = 0;
+    this.lossy = true;
+    this.hostDropped = 0;
+    try {
+      // c.upf may merge more units per frame than the profile (tied to the waterfall row time)
+      const upf = Math.min(1000, Math.max(profile[4], c.upf || 0));
+      await this.command(
+        `SPEC 0 ${profile[3]} ${upf} ${c.maxHold === false ? 0 : 1} ${profile[1]}${this.hasSpecN ? ' ' + n : ''}${this.hasSpecN && this.hasSpecStats ? ' 1' : ''}`,
+      );
+      const head = (await this.line('SPEC ')).split(' ');
+      const info = {
+        nfft: Number(head[1]),
+        fs: Number(head[2]),
+        lo: Number(head[4]) * 1e6,
+        gain,
+        crcErrors: 0,
+      };
+      if (head.length !== 5 || info.nfft !== n || info.fs !== c.rate || info.lo !== c.frequency * 1e6)
+        throw Error('Unexpected spectrum header');
+      for (;;) {
+        if ((++count & 15) === 0) await yieldTask();
+        if (!stopping && shouldStop()) {
+          stopping = true;
+          await this.command('');
+        }
+        const events = decoder.feed(
+          await this.read(Math.max(1, Math.min(this.queued, 8192)), performance.now() + 5000),
+        );
+        // Report corruption even when no valid spectrum survives this read.
+        const crcErrors = decoder.crcErrors - info.crcErrors;
+        info.crcErrors = decoder.crcErrors;
+        info.hostDropped = this.hostDropped;
+        if (crcErrors) {
+          this.spectrumCrcErrors += crcErrors;
+          this.onCaptureError?.();
+        }
+        for (const event of events) {
+          if (event.report) {
+            ended = true;
+            info.report = event.report;
+            if (event.status) throw Error(`Spectrum capture stopped: ${event.report}`);
+            return info;
+          }
+          if (event.stats) {
+            info.stats = event.stats;
+            continue;
+          }
+          const h = event.header;
+          h.t = h.pairIndex / info.fs;
+          onFrame(h, event.bins, info);
+        }
+      }
+    } finally {
+      this.lossy = false;
+      if (!ended && !this.failed && this.writer) {
+        try {
+          await this.command('');
+          const deadline = performance.now() + 2000;
+          while (!ended) {
+            const events = decoder.feed(await this.read(Math.max(1, Math.min(this.queued, 8192)), deadline));
+            ended = events.some((event) => event.report);
+          }
+        } catch (error) {
+          // An unknown stream boundary must not be reused for ordinary commands.
+          this.failed = error;
+        }
+      }
     }
-    if(event.stats){info.stats=event.stats;continue;}
-    const h=event.header;h.t=h.pairIndex/info.fs;
-    onFrame(h,event.bins,info);
-   }
-  }
- }finally{
-  this.lossy=false;
-  if(!ended&&!this.failed&&this.writer){
-   try{
-    await this.command('');const deadline=performance.now()+2000;
-    while(!ended){
-     const events=decoder.feed(await this.read(Math.max(1,Math.min(this.queued,8192)),deadline));
-     ended=events.some(event=>event.report);
-    }
-   }catch(error){
-    // An unknown stream boundary must not be reused for ordinary commands.
-    this.failed=error;
-   }
-  }
- }
-});};
+  });
+};
 
 // ESPsoup panorama. "SWP mhz nfft crc us" text header + nfft int16 (0.01 dB, already
 // in host order -fs/2..+fs/2, Q negated on-device), then "END SWEEP steps us". The text
 // header + binary payload framing is not byte-resyncable, so (unlike spec) lossy stays
 // off and the stop path drains whole frames to END, never line-scanning for it.
-BurstSerialRadio.prototype.sweep=function(c,onStep,shouldStop){return this.run(async()=>{
- if(!this.hasSweep)throw Error('Panorama sweep is unavailable on this firmware.');
- const rateIdx=this.rxRates.indexOf(c.rate),{f0,f1,step,nfft,navg}=c;
- if(rateIdx<0||![f0,f1,step,nfft,navg].every(Number.isInteger)||f0>=f1||f1>6000||step<1||nfft<64||nfft>1024||(nfft&(nfft-1))!==0||navg<1||nfft*navg>16380||(f1-f0)/step>2000)throw Error('Invalid sweep settings');
- const gain=await this.setGain(c.gainMode,c.gain);
- const info={fs:c.rate,nfft,f0,f1,step,gain,crcErrors:0,report:null};
- const hdr=/^SWP (\d+) (\d+) ([0-9a-fA-F]{1,8}) (\d+)$/;
- let stopping=false,count=0,ended=false,started=false;
- try{
-  await this.command(`SWEEP ${f0} ${f1} ${step} ${rateIdx} ${nfft} ${navg}`);started=true;
-  for(;;){
-   if((++count&7)===0)await yieldTask();
-   if(!stopping&&shouldStop()){stopping=true;await this.command('');}
-   const header=await this.line('',96);
-   if(header.startsWith('END SWEEP')){ended=true;info.report=header;return info;}
-   if(header.startsWith('ERR '))throw Error(header);
-   const h=hdr.exec(header);
-   if(!h)throw Object.assign(Error('Invalid sweep header: '+header),{code:'CAPTURE_DAMAGED'});
-   if(Number(h[2])!==nfft)throw Object.assign(Error('Sweep bin mismatch'),{code:'CAPTURE_DAMAGED'});
-   const payload=await this.read(nfft*2,performance.now()+5000,500);
-   if(crc32(payload)!==parseInt(h[3],16)){this.spectrumCrcErrors++;info.crcErrors++;this.onCaptureError?.();continue;}
-   const dv=new DataView(payload.buffer,payload.byteOffset,payload.byteLength),bins=new Float32Array(nfft);
-   for(let j=0;j<nfft;j++)bins[j]=dv.getInt16(j*2,true)/100;
-   onStep({mhz:Number(h[1]),us:Number(h[4])},bins,info);
-  }
- }finally{
-  this.frequency=null; // SWEEP retuned the device internally; force the next tune to resend FREQ
-  if(!ended&&!this.failed&&this.writer&&started){
-   try{
-    await this.command('');const deadline=performance.now()+3000;
-    while(!ended){
-     const header=await this.line('',96);
-     if(header.startsWith('END SWEEP')){ended=true;break;}
-     const h=hdr.exec(header);
-     if(h)await this.read(nfft*2,deadline,500);
-     else if(performance.now()>deadline)throw Error('Sweep drain timeout');
+BurstSerialRadio.prototype.sweep = function (c, onStep, shouldStop) {
+  return this.run(async () => {
+    if (!this.hasSweep) throw Error('Panorama sweep is unavailable on this firmware.');
+    const rateIdx = this.rxRates.indexOf(c.rate),
+      { f0, f1, step, nfft, navg } = c;
+    if (
+      rateIdx < 0 ||
+      ![f0, f1, step, nfft, navg].every(Number.isInteger) ||
+      f0 >= f1 ||
+      f1 > 6000 ||
+      step < 1 ||
+      nfft < 64 ||
+      nfft > 1024 ||
+      (nfft & (nfft - 1)) !== 0 ||
+      navg < 1 ||
+      nfft * navg > 16380 ||
+      (f1 - f0) / step > 2000
+    )
+      throw Error('Invalid sweep settings');
+    const gain = await this.setGain(c.gainMode, c.gain);
+    const info = { fs: c.rate, nfft, f0, f1, step, gain, crcErrors: 0, report: null };
+    const hdr = /^SWP (\d+) (\d+) ([0-9a-fA-F]{1,8}) (\d+)$/;
+    let stopping = false,
+      count = 0,
+      ended = false,
+      started = false;
+    try {
+      await this.command(`SWEEP ${f0} ${f1} ${step} ${rateIdx} ${nfft} ${navg}`);
+      started = true;
+      for (;;) {
+        if ((++count & 7) === 0) await yieldTask();
+        if (!stopping && shouldStop()) {
+          stopping = true;
+          await this.command('');
+        }
+        const header = await this.line('', 96);
+        if (header.startsWith('END SWEEP')) {
+          ended = true;
+          info.report = header;
+          return info;
+        }
+        if (header.startsWith('ERR ')) throw Error(header);
+        const h = hdr.exec(header);
+        if (!h) throw Object.assign(Error('Invalid sweep header: ' + header), { code: 'CAPTURE_DAMAGED' });
+        if (Number(h[2]) !== nfft)
+          throw Object.assign(Error('Sweep bin mismatch'), { code: 'CAPTURE_DAMAGED' });
+        const payload = await this.read(nfft * 2, performance.now() + 5000, 500);
+        if (crc32(payload) !== parseInt(h[3], 16)) {
+          this.spectrumCrcErrors++;
+          info.crcErrors++;
+          this.onCaptureError?.();
+          continue;
+        }
+        const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength),
+          bins = new Float32Array(nfft);
+        for (let j = 0; j < nfft; j++) bins[j] = dv.getInt16(j * 2, true) / 100;
+        onStep({ mhz: Number(h[1]), us: Number(h[4]) }, bins, info);
+      }
+    } finally {
+      this.frequency = null; // SWEEP retuned the device internally; force the next tune to resend FREQ
+      if (!ended && !this.failed && this.writer && started) {
+        try {
+          await this.command('');
+          const deadline = performance.now() + 3000;
+          while (!ended) {
+            const header = await this.line('', 96);
+            if (header.startsWith('END SWEEP')) {
+              ended = true;
+              break;
+            }
+            const h = hdr.exec(header);
+            if (h) await this.read(nfft * 2, deadline, 500);
+            else if (performance.now() > deadline) throw Error('Sweep drain timeout');
+          }
+        } catch (error) {
+          this.failed = error;
+        }
+      }
     }
-   }catch(error){this.failed=error;}
-  }
- }
-});};
+  });
+};
 
 // ESPsoup continuous spectrum. "OK CSPEC fs nfft navg mode words lines", then per block
 // "SPL seq t0 lines nfft mode gap crc" + lines*nfft u8 (mode 2: nfft mean then nfft max),
 // then "END CSPEC seq blocks lost overruns why". Bins are host order -fs/2..+fs/2 (DC
 // centred, Q negated on-device); u8 = 2*10*log10(|X|^2)+12*sh. Same no-lossy / frame-aware
 // drain discipline as sweep().
-BurstSerialRadio.prototype.cspec=function(c,onLine,shouldStop){return this.run(async()=>{
- if(!this.hasCspec)throw Error('Continuous spectrum is unavailable on this firmware.');
- const rateIdx=this.rxRates.indexOf(c.rate),nfft=c.nfft,navg=c.navg,mode=c.mode,stride=Number.isInteger(c.stride)&&c.stride>0?c.stride:1;
- if(rateIdx<0||![nfft,navg,mode].every(Number.isInteger)||nfft<16||nfft>256||(nfft&(nfft-1))!==0||navg<1||mode<0||mode>2||nfft*navg*stride>8192)throw Error('Invalid cspec settings');
- await this.tune(c.frequency,c.bandwidth??0);
- const gain=await this.setGain(c.gainMode,c.gain),bpp=mode===2?2:1,sh=nfft>64?Math.log2(nfft)-6:0;
- const info={fs:c.rate,nfft,navg,mode,sh,gain,crcErrors:0,report:null};
- const hdr=/^SPL (\d+) (-?\d+) (\d+) (\d+) (\d+) (-?\d+) ([0-9a-fA-F]{1,8})$/;
- let stopping=false,count=0,ended=false,started=false;
- try{
-  await this.command(`CSPEC ${rateIdx} ${nfft} ${navg} ${mode} ${stride}`);
-  const head=/^OK CSPEC (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)$/.exec(await this.line('OK CSPEC',96));
-  if(!head||Number(head[1])!==c.rate||Number(head[2])!==nfft)throw Error('Unexpected CSPEC header');
-  info.linesPerBlock=Number(head[6]);started=true;
-  for(;;){
-   if((++count&7)===0)await yieldTask();
-   if(!stopping&&shouldStop()){stopping=true;await this.command('');}
-   const header=await this.line('',128);
-   if(header.startsWith('END CSPEC')){ended=true;info.report=header;info.why=header.split(' ')[6]||'';return info;}
-   if(header.startsWith('ERR '))throw Error(header);
-   const h=hdr.exec(header);
-   if(!h)throw Object.assign(Error('Invalid CSPEC header: '+header),{code:'CAPTURE_DAMAGED'});
-   const lines=Number(h[3]);
-   if(Number(h[4])!==nfft||Number(h[5])!==mode)throw Object.assign(Error('CSPEC frame mismatch'),{code:'CAPTURE_DAMAGED'});
-   const payload=await this.read(lines*nfft*bpp,performance.now()+5000,500);
-   if(crc32(payload)!==parseInt(h[7],16)){this.spectrumCrcErrors++;info.crcErrors++;this.onCaptureError?.();continue;}
-   const meta={seq:Number(h[1]),t:Number(h[2]),gap:Number(h[6]),nfft,sh,fs:c.rate};
-   for(let ln=0;ln<lines;ln++){const off=ln*nfft*bpp;onLine(payload.subarray(off,off+nfft),meta,info);}
-  }
- }finally{
-  if(!ended&&!this.failed&&this.writer&&started){
-   try{
-    await this.command('');const deadline=performance.now()+3000;
-    while(!ended){
-     const header=await this.line('',128);
-     if(header.startsWith('END CSPEC')){ended=true;break;}
-     const h=hdr.exec(header);
-     if(h)await this.read(Number(h[3])*nfft*bpp,deadline,500);
-     else if(performance.now()>deadline)throw Error('CSPEC drain timeout');
+BurstSerialRadio.prototype.cspec = function (c, onLine, shouldStop) {
+  return this.run(async () => {
+    if (!this.hasCspec) throw Error('Continuous spectrum is unavailable on this firmware.');
+    const rateIdx = this.rxRates.indexOf(c.rate),
+      nfft = c.nfft,
+      navg = c.navg,
+      mode = c.mode,
+      stride = Number.isInteger(c.stride) && c.stride > 0 ? c.stride : 1;
+    if (
+      rateIdx < 0 ||
+      ![nfft, navg, mode].every(Number.isInteger) ||
+      nfft < 16 ||
+      nfft > 256 ||
+      (nfft & (nfft - 1)) !== 0 ||
+      navg < 1 ||
+      mode < 0 ||
+      mode > 2 ||
+      nfft * navg * stride > 8192
+    )
+      throw Error('Invalid cspec settings');
+    await this.tune(c.frequency, c.bandwidth ?? 0);
+    const gain = await this.setGain(c.gainMode, c.gain),
+      bpp = mode === 2 ? 2 : 1,
+      sh = nfft > 64 ? Math.log2(nfft) - 6 : 0;
+    const info = { fs: c.rate, nfft, navg, mode, sh, gain, crcErrors: 0, report: null };
+    const hdr = /^SPL (\d+) (-?\d+) (\d+) (\d+) (\d+) (-?\d+) ([0-9a-fA-F]{1,8})$/;
+    let stopping = false,
+      count = 0,
+      ended = false,
+      started = false;
+    try {
+      await this.command(`CSPEC ${rateIdx} ${nfft} ${navg} ${mode} ${stride}`);
+      const head = /^OK CSPEC (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)$/.exec(await this.line('OK CSPEC', 96));
+      if (!head || Number(head[1]) !== c.rate || Number(head[2]) !== nfft)
+        throw Error('Unexpected CSPEC header');
+      info.linesPerBlock = Number(head[6]);
+      started = true;
+      for (;;) {
+        if ((++count & 7) === 0) await yieldTask();
+        if (!stopping && shouldStop()) {
+          stopping = true;
+          await this.command('');
+        }
+        const header = await this.line('', 128);
+        if (header.startsWith('END CSPEC')) {
+          ended = true;
+          info.report = header;
+          info.why = header.split(' ')[6] || '';
+          return info;
+        }
+        if (header.startsWith('ERR ')) throw Error(header);
+        const h = hdr.exec(header);
+        if (!h) throw Object.assign(Error('Invalid CSPEC header: ' + header), { code: 'CAPTURE_DAMAGED' });
+        const lines = Number(h[3]);
+        if (Number(h[4]) !== nfft || Number(h[5]) !== mode)
+          throw Object.assign(Error('CSPEC frame mismatch'), { code: 'CAPTURE_DAMAGED' });
+        const payload = await this.read(lines * nfft * bpp, performance.now() + 5000, 500);
+        if (crc32(payload) !== parseInt(h[7], 16)) {
+          this.spectrumCrcErrors++;
+          info.crcErrors++;
+          this.onCaptureError?.();
+          continue;
+        }
+        const meta = { seq: Number(h[1]), t: Number(h[2]), gap: Number(h[6]), nfft, sh, fs: c.rate };
+        for (let ln = 0; ln < lines; ln++) {
+          const off = ln * nfft * bpp;
+          onLine(payload.subarray(off, off + nfft), meta, info);
+        }
+      }
+    } finally {
+      if (!ended && !this.failed && this.writer && started) {
+        try {
+          await this.command('');
+          const deadline = performance.now() + 3000;
+          while (!ended) {
+            const header = await this.line('', 128);
+            if (header.startsWith('END CSPEC')) {
+              ended = true;
+              break;
+            }
+            const h = hdr.exec(header);
+            if (h) await this.read(Number(h[3]) * nfft * bpp, deadline, 500);
+            else if (performance.now() > deadline) throw Error('CSPEC drain timeout');
+          }
+        } catch (error) {
+          this.failed = error;
+        }
+      }
     }
-   }catch(error){this.failed=error;}
-  }
- }
-});};
+  });
+};
 
 // ESPsoup GFSK/BLE packet catcher. "GFSK rate_idx R kbps mode len" (mode 0 = BLE: on-device GFSK
 // demod + per-channel de-whitening from FREQ + length from the header + CRC-24 checked). Reply
@@ -621,48 +1605,100 @@ BurstSerialRadio.prototype.cspec=function(c,onLine,shouldStop){return this.run(a
 // the de-whitened PDU (2-byte header + payload + 3-byte CRC-24, n = payload_len + 5); crc32 is the
 // transport integrity of those bytes; flags bit0 = BLE CRC-24 ok, bit2 = BLE PDU. Needs a fixed
 // gain (the AGC changes gain inside a packet). Same no-lossy / frame-aware drain as cspec().
-BurstSerialRadio.prototype.gfsk=function(c,onPacket,shouldStop){return this.run(async()=>{
- if(!this.hasGfsk)throw Error('GFSK packet capture is unavailable on this firmware.');
- const rateIdx=Number(c.rateIdx),R=Number(c.R),len=Number(c.len);
- if(![2,3,4,5].includes(rateIdx)||![1,2,4].includes(R)||!Number.isInteger(len)||len<8||len>255)throw Error('Invalid GFSK settings');
- await this.tune(c.frequency,0);
- const gain=await this.setGain(c.gainMode,c.gain);
- const info={gain,crcErrors:0,report:null};
- const hdr=/^GPK (\d+) (\d+) (\d+) (\d+) (-?\d+) (-?\d+) (-?\d+) (\d+) ([0-9a-fA-F]{1,8})$/;
- let stopping=false,count=0,ended=false,started=false;
- try{
-  await this.command(`GFSK ${rateIdx} ${R} 1000 0 ${len}`);
-  const head=(await this.line('OK GFSK',160)).split(' ');
-  if(head.length<12||head[6]!=='0')throw Error('Unexpected GFSK header');
-  started=true;
-  for(;;){
-   if((++count&15)===0)await yieldTask();
-   if(!stopping&&shouldStop()){stopping=true;await this.command('');}
-   let header;
-   try{header=await this.line('',200);}
-   catch(e){if(e.code==='SERIAL_TIMEOUT'&&!this.failed&&!stopping)continue;throw e;} // quiet RF: keep waiting
-   if(header.startsWith('END GFSK')){ended=true;info.report=header;info.why=header.split(' ')[9]||'';return info;}
-   if(header.startsWith('ERR '))throw Error(header);
-   const h=hdr.exec(header);
-   if(!h)throw Object.assign(Error('Invalid GFSK header: '+header),{code:'CAPTURE_DAMAGED'});
-   const n=Number(h[3]);
-   const payload=await this.read(n,performance.now()+5000,1000);
-   if(crc32(payload)!==parseInt(h[9],16)){this.spectrumCrcErrors++;info.crcErrors++;this.onCaptureError?.();continue;}
-   const flags=Number(h[4]);
-   onPacket({seq:Number(h[1]),t:Number(h[2]),n,flags,crcOk:!!(flags&1),blePdu:!!(flags&4),rssi:Number(h[5])/10,cfo:Number(h[6]),dev:Number(h[7]),errs:Number(h[8])},payload,info);
-  }
- }finally{
-  if(!ended&&!this.failed&&this.writer&&started){
-   try{
-    await this.command('');const deadline=performance.now()+3000;
-    while(!ended){
-     const header=await this.line('',200);
-     if(header.startsWith('END GFSK')){ended=true;break;}
-     const h=hdr.exec(header);
-     if(h)await this.read(Number(h[3]),deadline,1000);
-     else if(performance.now()>deadline)throw Error('GFSK drain timeout');
+BurstSerialRadio.prototype.gfsk = function (c, onPacket, shouldStop) {
+  return this.run(async () => {
+    if (!this.hasGfsk) throw Error('GFSK packet capture is unavailable on this firmware.');
+    const rateIdx = Number(c.rateIdx),
+      R = Number(c.R),
+      len = Number(c.len);
+    if (
+      ![2, 3, 4, 5].includes(rateIdx) ||
+      ![1, 2, 4].includes(R) ||
+      !Number.isInteger(len) ||
+      len < 8 ||
+      len > 255
+    )
+      throw Error('Invalid GFSK settings');
+    await this.tune(c.frequency, 0);
+    const gain = await this.setGain(c.gainMode, c.gain);
+    const info = { gain, crcErrors: 0, report: null };
+    const hdr = /^GPK (\d+) (\d+) (\d+) (\d+) (-?\d+) (-?\d+) (-?\d+) (\d+) ([0-9a-fA-F]{1,8})$/;
+    let stopping = false,
+      count = 0,
+      ended = false,
+      started = false;
+    try {
+      await this.command(`GFSK ${rateIdx} ${R} 1000 0 ${len}`);
+      const head = (await this.line('OK GFSK', 160)).split(' ');
+      if (head.length < 12 || head[6] !== '0') throw Error('Unexpected GFSK header');
+      started = true;
+      for (;;) {
+        if ((++count & 15) === 0) await yieldTask();
+        if (!stopping && shouldStop()) {
+          stopping = true;
+          await this.command('');
+        }
+        let header;
+        try {
+          header = await this.line('', 200);
+        } catch (e) {
+          if (e.code === 'SERIAL_TIMEOUT' && !this.failed && !stopping) continue; // quiet RF: keep waiting
+          throw e;
+        }
+        if (header.startsWith('END GFSK')) {
+          ended = true;
+          info.report = header;
+          info.why = header.split(' ')[9] || '';
+          return info;
+        }
+        if (header.startsWith('ERR ')) throw Error(header);
+        const h = hdr.exec(header);
+        if (!h) throw Object.assign(Error('Invalid GFSK header: ' + header), { code: 'CAPTURE_DAMAGED' });
+        const n = Number(h[3]);
+        const payload = await this.read(n, performance.now() + 5000, 1000);
+        if (crc32(payload) !== parseInt(h[9], 16)) {
+          this.spectrumCrcErrors++;
+          info.crcErrors++;
+          this.onCaptureError?.();
+          continue;
+        }
+        const flags = Number(h[4]);
+        onPacket(
+          {
+            seq: Number(h[1]),
+            t: Number(h[2]),
+            n,
+            flags,
+            crcOk: !!(flags & 1),
+            blePdu: !!(flags & 4),
+            rssi: Number(h[5]) / 10,
+            cfo: Number(h[6]),
+            dev: Number(h[7]),
+            errs: Number(h[8]),
+          },
+          payload,
+          info,
+        );
+      }
+    } finally {
+      if (!ended && !this.failed && this.writer && started) {
+        try {
+          await this.command('');
+          const deadline = performance.now() + 3000;
+          while (!ended) {
+            const header = await this.line('', 200);
+            if (header.startsWith('END GFSK')) {
+              ended = true;
+              break;
+            }
+            const h = hdr.exec(header);
+            if (h) await this.read(Number(h[3]), deadline, 1000);
+            else if (performance.now() > deadline) throw Error('GFSK drain timeout');
+          }
+        } catch (error) {
+          this.failed = error;
+        }
+      }
     }
-   }catch(error){this.failed=error;}
-  }
- }
-});};
+  });
+};

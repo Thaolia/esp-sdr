@@ -1,23 +1,580 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP-WebSDR · USB receiver</title><link rel="icon" type="image/png" sizes="194x194" href="favicon-194x194.png"><link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png"><link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png"><link rel="stylesheet" href="fonts.css"><link rel="stylesheet" href="style.css"><script defer src="serial-transport.js"></script><script defer src="radio.js"></script><script defer src="triggers.js"></script><script defer src="ble.js"></script><script defer src="app.js"></script></head><body>
-<header><div class="brand"><button id="toggleControls" type="button" aria-label="Toggle controls panel" title="Toggle controls panel" aria-expanded="true" aria-controls="controls"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M7.5 2.5 3.5 6l4 3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><a href="https://espargos.net/" aria-label="ESPARGOS website"><img class="brand-logo" src="espargos-logo.svg" alt="ESPARGOS" width="175" height="35"></a><div><h1>ESP-WebSDR</h1><span>Raw IQ Capture with Espressif's ESP32 Chips</span></div></div><div class="connection"><span id="light"></span><span id="status">Disconnected</span><div id="chipIdentity" class="chip-identity" hidden><span id="deviceModel" aria-live="polite" aria-describedby="chipStats" tabindex="0" hidden></span><div id="chipStats" role="tooltip" hidden></div></div><span id="baudStatus" hidden></span><div class="connect-buttons"><button id="connect">Connect ESP-SDR</button><button id="choosePort" type="button" aria-label="Connection options" title="Connection options" aria-haspopup="menu" aria-expanded="false" aria-controls="connectMenu"><svg width="12" height="8" viewBox="0 0 12 8" aria-hidden="true"><path d="m2 2 4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id="connectMenu" role="menu" aria-label="Connection options" hidden><button id="openRecent" type="button" role="menuitem">Connect to Last Device</button><button id="openOther" type="button" role="menuitem">Choose WebSerial Device…</button><button id="openUSB" type="button" role="menuitem">Choose WebUSB Device…</button><button id="toggleGapFill" type="button" role="menuitem" hidden>Add gap-fill device…</button><a id="openFlasher" role="menuitem" href="flash.html" target="_blank" rel="noopener noreferrer">Flash Firmware…</a></div></div><button id="toggleHeader" type="button" aria-label="Toggle header size" title="Toggle header size" aria-expanded="true"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 7.5 6 4l3.5 3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button id="toggleDebug" type="button" aria-label="Toggle debug / UART panel" title="Toggle debug / UART panel" aria-expanded="false" aria-controls="debug"><svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true"><rect x="1" y="1" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3.5 4.5 5.5 6l-2 1.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></header>
-<main><aside id="controls">
-<label>Center frequency <span>MHz</span><input id="frequency" type="number" min="100" max="6000" step="1" value="2412"></label><div class="presets"><button data-freq="2442">2.442 GHz</button><button data-freq="5500">5.500 GHz</button></div><label title="The receiver is zero-IF: the LO sits at 0 Hz with a DC/LO-leakage spike. Offset LO keeps the tuned frequency away from it.">0 Hz (zero-IF)<select id="dcMode"><option value="raw" selected>show as is</option><option value="fill">fill DC bins</option><option value="offset">offset LO (signal off 0 Hz)</option></select></label>
-<div class="gain-control"><span id="gainModeLabel">RX gain mode</span><div class="gain-modes" role="group" aria-labelledby="gainModeLabel"><button id="gainAgc" type="button" aria-pressed="true" disabled>AGC</button><button id="gainManual" type="button" aria-pressed="false" disabled>Manual</button></div></div><label>Manual gain index <output id="gainValue">40</output><input id="gain" type="range" min="0" max="0" step="1" value="0" disabled></label><p id="gainStatus" class="note"></p>
-<div id="bandwidthControl" hidden><div class="gain-control"><span id="bandwidthModeLabel">Analog bandwidth</span><div class="gain-modes" role="group" aria-labelledby="bandwidthModeLabel"><button id="bandwidthOpen" type="button" aria-pressed="false" disabled>Open</button><button id="bandwidthFilter" type="button" aria-pressed="true" disabled>Filter</button></div></div><label>Filter bandwidth <span>MHz</span><input id="bandwidth" type="number" min="13" max="54" step="1" value="20" disabled></label></div><label>Sample rate / nominal span<select id="rate"><option value="4000000">4 MS/s · 4 MHz</option><option value="6400000" disabled>6.4 MS/s · 6.4 MHz</option><option value="8000000">8 MS/s · 8 MHz</option><option value="10000000">10 MS/s · 10 MHz</option><option value="10666667" disabled>10.667 MS/s · 10.667 MHz</option><option value="16000000" disabled>16 MS/s · 16 MHz</option><option value="20000000">20 MS/s · 20 MHz</option><option value="32000000" disabled>32 MS/s · 32 MHz</option><option value="40000000">40 MS/s · 40 MHz</option><option value="80000000" selected>80 MS/s · 80 MHz</option></select></label>
-<div class="capture-modes" role="group" aria-labelledby="captureModeLabel">
-<div id="captureModeLabel" class="eyebrow">Mode options</div>
-<div id="iqControls" class="capture-options"><label id="fftControl">FFT bins<select id="fft"><option>256</option><option>512</option><option>1024</option><option selected>2048</option><option>4096</option><option id="fft8192" hidden>8192</option><option id="fft16384" hidden>16384</option></select></label><label>I/Q<select id="bits"><option value="8">8 + 8 bits</option><option value="10">10 + 10 bits</option></select></label></div>
-<div id="specOptions" class="capture-options" hidden><label>Waterfall row<select id="specRow" disabled><option value="0">every spectrum</option><option value="10">10 ms · max</option><option value="33" selected>33 ms · max</option><option value="50">50 ms · max</option></select></label><label>Detector<select id="specDetector" disabled><option value="mean" selected>average (like burst mode)</option><option value="max">max-hold (bursts, edges)</option></select></label><p id="specNote" class="note" hidden></p><p class="note">Contributed by <a href="https://www.z2labs.io" target="_blank" rel="noopener noreferrer">https://www.z2labs.io</a></p></div>
-<div id="sweepOptions" class="capture-options" hidden><label>Start <span>MHz</span><input id="sweepF0" type="number" min="100" max="6000" step="1" value="2400"></label><label>Stop <span>MHz</span><input id="sweepF1" type="number" min="100" max="6000" step="1" value="2500"></label><label>Step <span>MHz</span><input id="sweepStep" type="number" min="1" max="500" step="1" value="40"></label><label>FFT bins<select id="sweepFft"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select></label><label>Averaging<select id="sweepNavg"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option><option value="8" selected>8×</option><option value="16">16×</option></select></label><p class="note">Wideband panorama: sweeps the whole range you set, placing each step at its centre frequency.</p></div>
-<div id="cspecOptions" class="capture-options" hidden><label>FFT bins<select id="cspecFft"><option value="16">16</option><option value="32">32</option><option value="64" selected>64</option><option value="128">128</option><option value="256">256</option></select></label><label>Detector<select id="cspecDetector"><option value="max" selected>max-hold</option><option value="mean">average</option></select></label><label>Averaging<select id="cspecNavg"><option value="4">4×</option><option value="8" selected>8×</option><option value="16">16×</option><option value="32">32×</option></select></label><p class="note">Gap-free continuous waterfall from the on-chip engine (native USB).</p></div>
-<div id="bleOptions" class="capture-options" hidden><label>Advertising channel<select id="bleChannel"><option value="37">37 · 2402 MHz</option><option value="38" selected>38 · 2426 MHz</option><option value="39">39 · 2480 MHz</option></select></label><label>Decode source<select id="bleSource" title="Where BLE packets are demodulated: on the ESP32 (continuous GFSK catcher) or in the browser from captured raw I/Q."><option value="device" selected>On-device · on the board</option><option value="iq">Raw I/Q · in the browser</option></select></label><p class="note">Decode source: on-device demodulates on the board (continuous, catches more); raw I/Q decodes captured samples in the browser (one packet per window). Passive scan — addresses are often random/rotating (see the type column), a name only shows when advertised, fixed gain.</p></div>
-</div>
-<div class="divider"></div><div class="eyebrow">Display</div><label>Floor <output id="floorValue">−100 dBFS</output><input id="floor" type="range" min="-140" max="-40" value="-100"></label><label>Range <output id="rangeValue">80 dB</output><input id="range" type="range" min="20" max="120" value="80"></label><label>Trace averaging<select id="average"><option value="0">Off</option><option selected value="0.3">Short</option><option value="0.65">Medium</option><option value="0.9">High</option></select></label><label class="check"><input id="hold" type="checkbox">Max hold</label><label class="check"><input id="autoscale" type="checkbox">Auto scale</label><div class="eyebrow mk-head">Channel markers</div><div class="markers"><label class="check mk-wifi24"><input id="markWifi24" class="mk" type="checkbox">Wi-Fi 2.4</label><label class="check mk-wifi5"><input id="markWifi5" class="mk" type="checkbox">Wi-Fi 5</label><label class="check mk-ble"><input id="markBle" class="mk" type="checkbox">BLE</label><label class="check mk-bt"><input id="markBt" class="mk" type="checkbox">BT classic</label></div><label class="check"><input id="markWaterfall" class="mk" type="checkbox">Show on waterfall</label><details id="calControls"><summary>Frequency calibration</summary><p id="calStatus" class="note">Calibration off</p><label>Offset <span>ppm</span><input id="calPpm" class="mk" type="number" step="0.1" value="0"></label><div class="actions"><button id="calFromPeak" type="button" disabled>Calibrate from peak</button><button id="calReset" type="button">Reset</button></div><div id="calForm" hidden><p class="note">Observed peak: <output id="calObserved">—</output></p><label>True frequency <span>MHz</span><input id="calTrue" type="number" step="0.001" min="0"></label><p id="calPreview"></p><div class="actions"><button id="calApply" type="button">Apply</button><button id="calPick" type="button" aria-pressed="false">Pick on graph</button></div><p class="note">Tune to a strong, frequency-accurate reference. If it sits near the center, set “0 Hz” above to “offset LO” so it clears the DC spike.</p></div></details><div id="profileBox" hidden><p class="note">Saved profile: <b id="profileKey"></b> <button id="profileForget" type="button" class="quiet">forget</button></p></div>
-<div class="actions"><button id="pause" disabled>Pause</button><button id="clear">Clear</button></div>
-<details id="gpioControls" hidden><summary>GPIO</summary><p class="gpio-help">Z: high impedance · 0: low · 1: high</p><div id="gpioPins"></div><p id="gpioEmpty" class="gpio-help" hidden>No GPIO outputs available.</p></details></aside>
-<section class="display"><div id="error" role="alert" hidden><span id="errorText"></span><button id="dismissError" class="banner-close" type="button" aria-label="Dismiss error message" title="Dismiss error message"><span aria-hidden="true">×</span></button></div><div id="firmwareWarning" role="status" hidden><span id="firmwareWarningText"></span> <a id="updateFirmware" href="flash.html" target="_blank" rel="noopener noreferrer">Update firmware…</a><button id="dismissFirmwareWarning" class="banner-close" type="button" aria-label="Dismiss firmware warning" title="Dismiss firmware warning"><span aria-hidden="true">×</span></button></div><div id="serialWarning" role="status" aria-live="polite" hidden><span id="serialWarningText"></span> <button id="lowerBaud" type="button">Switch to 1 MBaud</button><button id="dismissSerialWarning" class="banner-close" type="button" aria-label="Dismiss capture warning" title="Dismiss capture warning"><span aria-hidden="true">×</span></button></div><div id="tuningWarning" role="status" hidden><span id="tuningWarningText"></span><button id="dismissTuningWarning" class="banner-close" type="button" aria-label="Dismiss tuning warning" title="Dismiss tuning warning"><span aria-hidden="true">×</span></button></div>
-<div class="chart"><div class="charthead"><div id="modeBar" role="group" aria-label="Capture mode"><button id="modeIq" class="modebtn" type="button" aria-pressed="true" title="Raw I/Q capture: spectrum and waterfall computed on the host from I/Q snapshots.">I/Q</button><button id="modeSpec" class="modebtn" type="button" aria-pressed="false" hidden title="On-device FFT streamed as a live spectrum and waterfall.">Spectrum</button><button id="modeCspec" class="modebtn" type="button" aria-pressed="false" hidden title="Gap-free continuous waterfall from the on-chip engine (native USB).">Live waterfall</button><button id="modeSweep" class="modebtn" type="button" aria-pressed="false" hidden title="Wideband panorama: sweeps the whole range you set, one step at its centre frequency.">Panorama</button><button id="modeBle" class="modebtn" type="button" aria-pressed="false" hidden title="Passive Bluetooth LE advertising scan: lists nearby advertising devices.">BLE scan</button></div><span id="dualStatus" hidden></span><span id="cursor"></span></div><canvas id="spectrum" aria-label="Received power spectrum"></canvas><div id="axis" class="axis"><canvas id="axisCanvas" aria-label="Frequency axis: wheel to zoom, drag to pan, double-click for full span"></canvas></div><div id="meas" style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 18px;padding:7px 12px 9px;border-top:1px solid #293135;font:12.5px/1.45 Consolas,ui-monospace,monospace;color:#8f9ca2"></div></div>
-<div id="splitter" title="Drag: spectrum / waterfall height · double-click: default"></div><div class="chart waterfall"><div class="charthead"><span>Waterfall </span><span id="scale">−100 → −20 dBFS</span></div><canvas id="waterfall" aria-label="Received waterfall history"></canvas><canvas id="waterfallMarkers" aria-hidden="true"></canvas><div id="empty"><div class="empty-icon">▥</div><h2>Connect ESP-SDR to start</h2></div></div>
-<div id="blePanel" class="chart" hidden><div class="charthead"><span id="bleHead">BLE devices</span><button id="bleClear" type="button" class="quiet">Clear</button></div><p id="bleLegend" class="note"></p><div id="bleTableWrap"><table id="bleTable"><thead><tr><th>Address</th><th title="BLE advertiser address type — see the legend above.">Type</th><th>Name</th><th class="num">RSSI</th><th class="num">Seen</th><th class="num">#</th></tr></thead><tbody id="bleBody"></tbody></table><div id="bleEmpty" class="note">Listening for advertising packets…</div></div></div>
-<footer><div><b id="fps">—</b> <span id="fpsLabel">frames/s</span></div><div><b id="throughput">—</b> <span id="throughputLabel">kS/s delivered</span></div><div><b id="latency">—</b> <span id="latencyLabel">ms / capture + transfer</span></div><div><b id="peak">—</b> peak MHz</div><div id="crc">CRC —</div><nav class="source-links" aria-label="Source code on GitHub"><span>Source on GitHub</span><a href="https://github.com/ESPARGOS/esp-sdr" target="_blank" rel="noopener noreferrer" aria-label="esp-sdr firmware source on GitHub">esp-sdr ↗</a><a href="https://github.com/ESPARGOS/esp-web-sdr" target="_blank" rel="noopener noreferrer" aria-label="esp-web-sdr web interface source on GitHub">esp-web-sdr ↗</a></nav></footer></section><aside id="debug" aria-label="Debug and UART traffic"><div class="eyebrow dbg-head"><span>Debug · UART</span><button id="debugClear" type="button" class="quiet">Clear</button></div><div id="debugStat" class="note">Disconnected</div><div id="debugLog" role="log" aria-live="off"></div></aside></main>
-</body></html>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ESP-WebSDR · USB receiver</title>
+    <link rel="icon" type="image/png" sizes="194x194" href="favicon-194x194.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png" />
+    <link rel="stylesheet" href="fonts.css" />
+    <link rel="stylesheet" href="style.css" />
+    <script defer src="serial-transport.js"></script>
+    <script defer src="radio.js"></script>
+    <script defer src="triggers.js"></script>
+    <script defer src="ble.js"></script>
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <button
+          id="toggleControls"
+          type="button"
+          aria-label="Toggle controls panel"
+          title="Toggle controls panel"
+          aria-expanded="true"
+          aria-controls="controls"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+            <path
+              d="M7.5 2.5 3.5 6l4 3.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <a href="https://espargos.net/" aria-label="ESPARGOS website"
+          ><img class="brand-logo" src="espargos-logo.svg" alt="ESPARGOS" width="175" height="35"
+        /></a>
+        <div>
+          <h1>ESP-WebSDR</h1>
+          <span>Raw IQ Capture with Espressif's ESP32 Chips</span>
+        </div>
+      </div>
+      <div class="connection">
+        <span id="light"></span><span id="status">Disconnected</span>
+        <div id="chipIdentity" class="chip-identity" hidden>
+          <span id="deviceModel" aria-live="polite" aria-describedby="chipStats" tabindex="0" hidden></span>
+          <div id="chipStats" role="tooltip" hidden></div>
+        </div>
+        <span id="baudStatus" hidden></span>
+        <div class="connect-buttons">
+          <button id="connect">Connect ESP-SDR</button
+          ><button
+            id="choosePort"
+            type="button"
+            aria-label="Connection options"
+            title="Connection options"
+            aria-haspopup="menu"
+            aria-expanded="false"
+            aria-controls="connectMenu"
+          >
+            <svg width="12" height="8" viewBox="0 0 12 8" aria-hidden="true">
+              <path
+                d="m2 2 4 4 4-4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+          <div id="connectMenu" role="menu" aria-label="Connection options" hidden>
+            <button id="openRecent" type="button" role="menuitem">Connect to Last Device</button
+            ><button id="openOther" type="button" role="menuitem">Choose WebSerial Device…</button
+            ><button id="openUSB" type="button" role="menuitem">Choose WebUSB Device…</button
+            ><button id="toggleGapFill" type="button" role="menuitem" hidden>Add gap-fill device…</button
+            ><a id="openFlasher" role="menuitem" href="flash.html" target="_blank" rel="noopener noreferrer"
+              >Flash Firmware…</a
+            >
+          </div>
+        </div>
+        <button
+          id="toggleHeader"
+          type="button"
+          aria-label="Toggle header size"
+          title="Toggle header size"
+          aria-expanded="true"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+            <path
+              d="M2.5 7.5 6 4l3.5 3.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button
+          id="toggleDebug"
+          type="button"
+          aria-label="Toggle debug / UART panel"
+          title="Toggle debug / UART panel"
+          aria-expanded="false"
+          aria-controls="debug"
+        >
+          <svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true">
+            <rect
+              x="1"
+              y="1"
+              width="12"
+              height="10"
+              rx="1.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
+            <path
+              d="M3.5 4.5 5.5 6l-2 1.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+      </div>
+    </header>
+    <main>
+      <aside id="controls">
+        <label
+          >Center frequency <span>MHz</span
+          ><input id="frequency" type="number" min="100" max="6000" step="1" value="2412"
+        /></label>
+        <div class="presets">
+          <button data-freq="2442">2.442 GHz</button><button data-freq="5500">5.500 GHz</button>
+        </div>
+        <label
+          title="The receiver is zero-IF: the LO sits at 0 Hz with a DC/LO-leakage spike. Offset LO keeps the tuned frequency away from it."
+          >0 Hz (zero-IF)<select id="dcMode">
+            <option value="raw" selected>show as is</option>
+            <option value="fill">fill DC bins</option>
+            <option value="offset">offset LO (signal off 0 Hz)</option>
+          </select></label
+        >
+        <div class="gain-control">
+          <span id="gainModeLabel">RX gain mode</span>
+          <div class="gain-modes" role="group" aria-labelledby="gainModeLabel">
+            <button id="gainAgc" type="button" aria-pressed="true" disabled>AGC</button
+            ><button id="gainManual" type="button" aria-pressed="false" disabled>Manual</button>
+          </div>
+        </div>
+        <label
+          >Manual gain index <output id="gainValue">40</output
+          ><input id="gain" type="range" min="0" max="0" step="1" value="0" disabled
+        /></label>
+        <p id="gainStatus" class="note"></p>
+        <div id="bandwidthControl" hidden>
+          <div class="gain-control">
+            <span id="bandwidthModeLabel">Analog bandwidth</span>
+            <div class="gain-modes" role="group" aria-labelledby="bandwidthModeLabel">
+              <button id="bandwidthOpen" type="button" aria-pressed="false" disabled>Open</button
+              ><button id="bandwidthFilter" type="button" aria-pressed="true" disabled>Filter</button>
+            </div>
+          </div>
+          <label
+            >Filter bandwidth <span>MHz</span
+            ><input id="bandwidth" type="number" min="13" max="54" step="1" value="20" disabled
+          /></label>
+        </div>
+        <label
+          >Sample rate / nominal span<select id="rate">
+            <option value="4000000">4 MS/s · 4 MHz</option>
+            <option value="6400000" disabled>6.4 MS/s · 6.4 MHz</option>
+            <option value="8000000">8 MS/s · 8 MHz</option>
+            <option value="10000000">10 MS/s · 10 MHz</option>
+            <option value="10666667" disabled>10.667 MS/s · 10.667 MHz</option>
+            <option value="16000000" disabled>16 MS/s · 16 MHz</option>
+            <option value="20000000">20 MS/s · 20 MHz</option>
+            <option value="32000000" disabled>32 MS/s · 32 MHz</option>
+            <option value="40000000">40 MS/s · 40 MHz</option>
+            <option value="80000000" selected>80 MS/s · 80 MHz</option>
+          </select></label
+        >
+        <div class="capture-modes" role="group" aria-labelledby="captureModeLabel">
+          <div id="captureModeLabel" class="eyebrow">Mode options</div>
+          <!-- Hidden compatibility toggle: the #modeBar in the spectrum chart head is the real
+               control; these keep the shared on-chip spectrum path reachable by its old ids. -->
+          <button id="iqMode" type="button" aria-pressed="true" aria-controls="iqControls" hidden></button
+          ><button
+            id="specMode"
+            type="button"
+            aria-pressed="false"
+            aria-controls="specOptions"
+            hidden
+          ></button>
+          <div id="iqControls" class="capture-options">
+            <label id="fftControl"
+              >FFT bins<select id="fft">
+                <option>256</option>
+                <option>512</option>
+                <option>1024</option>
+                <option selected>2048</option>
+                <option>4096</option>
+                <option id="fft8192" hidden>8192</option>
+                <option id="fft16384" hidden>16384</option>
+              </select></label
+            ><label
+              >I/Q<select id="bits">
+                <option value="8">8 + 8 bits</option>
+                <option value="10">10 + 10 bits</option>
+              </select></label
+            >
+          </div>
+          <div id="specOptions" class="capture-options" hidden>
+            <label
+              >Waterfall row<select id="specRow" disabled>
+                <option value="0" selected>every spectrum</option>
+                <option value="10">10 ms · max</option>
+                <option value="50">50 ms · max</option>
+              </select></label
+            ><label
+              >Detector<select id="specDetector" disabled>
+                <option value="mean" selected>average (like burst mode)</option>
+                <option value="max">max-hold (bursts, edges)</option>
+              </select></label
+            >
+            <p id="specNote" class="note" hidden></p>
+            <p class="note">
+              Contributed by
+              <a href="https://www.z2labs.io" target="_blank" rel="noopener noreferrer"
+                >https://www.z2labs.io</a
+              >
+            </p>
+          </div>
+          <div id="sweepOptions" class="capture-options" hidden>
+            <label
+              >Start <span>MHz</span
+              ><input id="sweepF0" type="number" min="100" max="6000" step="1" value="2400"
+            /></label>
+            <label
+              >Stop <span>MHz</span
+              ><input id="sweepF1" type="number" min="100" max="6000" step="1" value="2500"
+            /></label>
+            <label
+              >Step <span>MHz</span><input id="sweepStep" type="number" min="1" max="500" step="1" value="40"
+            /></label>
+            <label
+              >FFT bins<select id="sweepFft">
+                <option>64</option>
+                <option>128</option>
+                <option selected>256</option>
+                <option>512</option>
+                <option>1024</option>
+              </select></label
+            ><label
+              >Averaging<select id="sweepNavg">
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+                <option value="8" selected>8×</option>
+                <option value="16">16×</option>
+              </select></label
+            >
+            <p class="note">
+              Wideband panorama: sweeps the whole range you set, placing each step at its centre frequency.
+            </p>
+          </div>
+          <div id="cspecOptions" class="capture-options" hidden>
+            <label
+              >FFT bins<select id="cspecFft">
+                <option value="16">16</option>
+                <option value="32">32</option>
+                <option value="64" selected>64</option>
+                <option value="128">128</option>
+                <option value="256">256</option>
+              </select></label
+            ><label
+              >Detector<select id="cspecDetector">
+                <option value="max" selected>max-hold</option>
+                <option value="mean">average</option>
+              </select></label
+            ><label
+              >Averaging<select id="cspecNavg">
+                <option value="4">4×</option>
+                <option value="8" selected>8×</option>
+                <option value="16">16×</option>
+                <option value="32">32×</option>
+              </select></label
+            >
+            <p class="note">Gap-free continuous waterfall from the on-chip engine (native USB).</p>
+          </div>
+          <div id="bleOptions" class="capture-options" hidden>
+            <label
+              >Advertising channel<select id="bleChannel">
+                <option value="37">37 · 2402 MHz</option>
+                <option value="38" selected>38 · 2426 MHz</option>
+                <option value="39">39 · 2480 MHz</option>
+              </select></label
+            ><label
+              >Decode source<select
+                id="bleSource"
+                title="Where BLE packets are demodulated: on the ESP32 (continuous GFSK catcher) or in the browser from captured raw I/Q."
+              >
+                <option value="device" selected>On-device · on the board</option>
+                <option value="iq">Raw I/Q · in the browser</option>
+              </select></label
+            >
+            <p class="note">
+              Decode source: on-device demodulates on the board (continuous, catches more); raw I/Q decodes
+              captured samples in the browser (one packet per window). Passive scan — addresses are often
+              random/rotating (see the type column), a name only shows when advertised, fixed gain.
+            </p>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="eyebrow">Display</div>
+        <label
+          >Floor <output id="floorValue">−100 dBFS</output
+          ><input id="floor" type="range" min="-140" max="-40" value="-100" /></label
+        ><label
+          >Range <output id="rangeValue">80 dB</output
+          ><input id="range" type="range" min="20" max="120" value="80" /></label
+        ><label
+          >Trace averaging<select id="average">
+            <option value="0">Off</option>
+            <option selected value="0.3">Short</option>
+            <option value="0.65">Medium</option>
+            <option value="0.9">High</option>
+          </select></label
+        ><label class="check"><input id="hold" type="checkbox" />Max hold</label
+        ><label class="check"><input id="autoscale" type="checkbox" />Auto scale</label>
+        <div class="eyebrow mk-head">Channel markers</div>
+        <div class="markers">
+          <label class="check mk-wifi24"><input id="markWifi24" class="mk" type="checkbox" />Wi-Fi 2.4</label>
+          <label class="check mk-wifi5"><input id="markWifi5" class="mk" type="checkbox" />Wi-Fi 5</label>
+          <label class="check mk-ble"><input id="markBle" class="mk" type="checkbox" />BLE</label>
+          <label class="check mk-bt"><input id="markBt" class="mk" type="checkbox" />BT classic</label>
+        </div>
+        <label class="check"><input id="markWaterfall" class="mk" type="checkbox" />Show on waterfall</label>
+        <details id="calControls">
+          <summary>Frequency calibration</summary>
+          <p id="calStatus" class="note">Calibration off</p>
+          <label
+            >Offset <span>ppm</span><input id="calPpm" class="mk" type="number" step="0.1" value="0"
+          /></label>
+          <div class="actions">
+            <button id="calFromPeak" type="button" disabled>Calibrate from peak</button
+            ><button id="calReset" type="button">Reset</button>
+          </div>
+          <div id="calForm" hidden>
+            <p class="note">Observed peak: <output id="calObserved">—</output></p>
+            <label
+              >True frequency <span>MHz</span><input id="calTrue" type="number" step="0.001" min="0"
+            /></label>
+            <p id="calPreview"></p>
+            <div class="actions">
+              <button id="calApply" type="button">Apply</button
+              ><button id="calPick" type="button" aria-pressed="false">Pick on graph</button>
+            </div>
+            <p class="note">
+              Tune to a strong, frequency-accurate reference. If it sits near the center, set “0 Hz” above to
+              “offset LO” so it clears the DC spike.
+            </p>
+          </div>
+        </details>
+        <div id="profileBox" hidden>
+          <p class="note">
+            Saved profile: <b id="profileKey"></b>
+            <button id="profileForget" type="button" class="quiet">forget</button>
+          </p>
+        </div>
+        <div class="actions"><button id="pause" disabled>Pause</button><button id="clear">Clear</button></div>
+        <details id="gpioControls" hidden>
+          <summary>GPIO</summary>
+          <p class="gpio-help">Z: high impedance · 0: low · 1: high</p>
+          <div id="gpioPins"></div>
+          <p id="gpioEmpty" class="gpio-help" hidden>No GPIO outputs available.</p>
+        </details>
+      </aside>
+      <section class="display">
+        <div id="error" role="alert" hidden>
+          <span id="errorText"></span
+          ><button
+            id="dismissError"
+            class="banner-close"
+            type="button"
+            aria-label="Dismiss error message"
+            title="Dismiss error message"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div id="firmwareWarning" role="status" hidden>
+          <span id="firmwareWarningText"></span>
+          <a id="updateFirmware" href="flash.html" target="_blank" rel="noopener noreferrer"
+            >Update firmware…</a
+          ><button
+            id="dismissFirmwareWarning"
+            class="banner-close"
+            type="button"
+            aria-label="Dismiss firmware warning"
+            title="Dismiss firmware warning"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div id="serialWarning" role="status" aria-live="polite" hidden>
+          <span id="serialWarningText"></span> <button id="lowerBaud" type="button">Switch to 1 MBaud</button
+          ><button
+            id="dismissSerialWarning"
+            class="banner-close"
+            type="button"
+            aria-label="Dismiss capture warning"
+            title="Dismiss capture warning"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div id="tuningWarning" role="status" hidden>
+          <span id="tuningWarningText"></span
+          ><button
+            id="dismissTuningWarning"
+            class="banner-close"
+            type="button"
+            aria-label="Dismiss tuning warning"
+            title="Dismiss tuning warning"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div class="chart">
+          <div class="charthead">
+            <div id="modeBar" role="group" aria-label="Capture mode">
+              <button
+                id="modeIq"
+                class="modebtn"
+                type="button"
+                aria-pressed="true"
+                title="Raw I/Q capture: spectrum and waterfall computed on the host from I/Q snapshots."
+              >
+                I/Q</button
+              ><button
+                id="modeSpec"
+                class="modebtn"
+                type="button"
+                aria-pressed="false"
+                hidden
+                title="On-device FFT streamed as a live spectrum and waterfall."
+              >
+                Spectrum</button
+              ><button
+                id="modeCspec"
+                class="modebtn"
+                type="button"
+                aria-pressed="false"
+                hidden
+                title="Gap-free continuous waterfall from the on-chip engine (native USB)."
+              >
+                Live waterfall</button
+              ><button
+                id="modeSweep"
+                class="modebtn"
+                type="button"
+                aria-pressed="false"
+                hidden
+                title="Wideband panorama: sweeps the whole range you set, one step at its centre frequency."
+              >
+                Panorama</button
+              ><button
+                id="modeBle"
+                class="modebtn"
+                type="button"
+                aria-pressed="false"
+                hidden
+                title="Passive Bluetooth LE advertising scan: lists nearby advertising devices."
+              >
+                BLE scan
+              </button>
+            </div>
+            <span id="dualStatus" hidden></span><span id="cursor"></span>
+          </div>
+          <canvas id="spectrum" aria-label="Received power spectrum"></canvas>
+          <div id="axis" class="axis">
+            <canvas
+              id="axisCanvas"
+              aria-label="Frequency axis: wheel to zoom, drag to pan, double-click for full span"
+            ></canvas>
+          </div>
+          <div
+            id="meas"
+            style="
+              display: flex;
+              flex-wrap: wrap;
+              justify-content: space-between;
+              gap: 4px 18px;
+              padding: 7px 12px 9px;
+              border-top: 1px solid #293135;
+              font:
+                12.5px/1.45 Consolas,
+                ui-monospace,
+                monospace;
+              color: #8f9ca2;
+            "
+          ></div>
+        </div>
+        <div id="splitter" title="Drag: spectrum / waterfall height · double-click: default"></div>
+        <div class="chart waterfall">
+          <div class="charthead"><span>Waterfall </span><span id="scale">−100 → −20 dBFS</span></div>
+          <canvas id="waterfall" aria-label="Received waterfall history"></canvas>
+          <canvas id="waterfallMarkers" aria-hidden="true"></canvas>
+          <div id="empty">
+            <div class="empty-icon">▥</div>
+            <h2>Connect ESP-SDR to start</h2>
+          </div>
+        </div>
+        <div id="blePanel" class="chart" hidden>
+          <div class="charthead">
+            <span id="bleHead">BLE devices</span
+            ><button id="bleClear" type="button" class="quiet">Clear</button>
+          </div>
+          <p id="bleLegend" class="note"></p>
+          <div id="bleTableWrap">
+            <table id="bleTable">
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th title="BLE advertiser address type — see the legend above.">Type</th>
+                  <th>Name</th>
+                  <th class="num">RSSI</th>
+                  <th class="num">Seen</th>
+                  <th class="num">#</th>
+                </tr>
+              </thead>
+              <tbody id="bleBody"></tbody>
+            </table>
+            <div id="bleEmpty" class="note">Listening for advertising packets…</div>
+          </div>
+        </div>
+        <footer>
+          <div><b id="fps">—</b> <span id="fpsLabel">frames/s</span></div>
+          <div><b id="throughput">—</b> <span id="throughputLabel">kS/s delivered</span></div>
+          <div><b id="latency">—</b> <span id="latencyLabel">ms / capture + transfer</span></div>
+          <div><b id="peak">—</b> peak MHz</div>
+          <div id="crc">CRC —</div>
+          <nav class="source-links" aria-label="Source code on GitHub">
+            <span>Source on GitHub</span
+            ><a
+              href="https://github.com/ESPARGOS/esp-sdr"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="esp-sdr firmware source on GitHub"
+              >esp-sdr ↗</a
+            ><a
+              href="https://github.com/ESPARGOS/esp-web-sdr"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="esp-web-sdr web interface source on GitHub"
+              >esp-web-sdr ↗</a
+            >
+          </nav>
+        </footer>
+      </section>
+      <aside id="debug" aria-label="Debug and UART traffic">
+        <div class="eyebrow dbg-head">
+          <span>Debug · UART</span><button id="debugClear" type="button" class="quiet">Clear</button>
+        </div>
+        <div id="debugStat" class="note">Disconnected</div>
+        <div id="debugLog" role="log" aria-live="off"></div>
+      </aside>
+    </main>
+  </body>
+</html>
